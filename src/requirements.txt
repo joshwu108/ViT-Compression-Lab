@@ -1,0 +1,6 @@
+transformers
+pytest
+ruff
+pillow
+vllm
+accelerate

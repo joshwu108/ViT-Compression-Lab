@@ -1,0 +1,41 @@
+# Python bytecode and package builds
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.virtualenv/
+
+# Tool and notebook caches
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local research data and generated artifacts
+/data/
+/checkpoints/
+/outputs/
+/runs/
+/artifacts/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# OS metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
