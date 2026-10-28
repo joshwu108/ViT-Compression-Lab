@@ -2,3 +2,6 @@ transformers
 Pillow
 accelerate
 torch
+# Fast kernels for the linear-attention layers
+flash-linear-attention==0.6.0
+causal-conv1d==1.7.0
