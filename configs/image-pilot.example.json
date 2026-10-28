@@ -1,0 +1,8 @@
+[
+  {
+    "image": "../src/images/test1.jpg",
+    "category": "debug",
+    "question": "What objects are visible in this image?",
+    "reference": "REPLACE: inspect this image and write the expected answer before running."
+  }
+]

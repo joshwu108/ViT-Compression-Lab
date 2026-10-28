@@ -50,3 +50,25 @@ Assuming a **10 Mbit/s** connection and transmitting the raw feature tensor:
 ```
 
 This is a theoretical payload transfer time, not a measured network result. Actual end-to-end time also includes serialization, protocol overhead, and network delays.
+
+# Experiment 1: Quantization Script
+
+Shape: (187, 5120)
+Dtype: torch.bfloat16
+Raw tensor bytes: 1914880
+Calculation shape: (187, 5120)
+Scale shape: (187, 1)
+Quantized shape: (187, 5120)
+Quantized dtype: torch.int8
+INT8 values + scales bytes: 958188
+Raw compression ratio (original / quantized): 1.998x
+Mean absolute error: 0.1200404167175293
+Maximum absolute error: 0.91015625
+Mean squared error: 0.024188905954360962
+Relative L2 error: 0.14092645974637916
+
+Per-token INT8 achieved 1.998× raw compression with 14.1% relative L2 reconstruction error on one image. The effect on downstream answer quality remains untested.
+
+CPU threads: 32
+Median quantization ms: 2.7747456915676594
+Median reconstruction ms: 0.45735202729701996
