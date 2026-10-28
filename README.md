@@ -1,30 +1,51 @@
-# qwen-vision-compression
+# ViT-compression-lab
 
-A learning-focused research repository for studying client-side Qwen vision
-encoders for real-time video understanding, with future exploration of feature
-compression, fine-tuning, and teacher–student distillation.
+A learning-focused research repository for compression of vision encoder
+features. Qwen3.8 is the first encoder under study; other encoders can have
+independent experiments alongside it.
 
-This scaffold contains no model implementation, pretrained weights, model or
-processor loading code, inference code, or training code. No checkpoint or GPU
-setup has been tested.
-
-## Directory map
+## Layout
 
 ```text
-.
-├── README.md
-├── AGENTS.md
-├── pyproject.toml
-├── .gitignore
-├── configs/README.md
-├── scripts/README.md
-├── src/qwen_vision_compression/__init__.py
-└── tests/test_package.py
+encoders/
+  Qwen3.8-vision-compression/
+    scripts/experiment.py          # Vision encoder latency and feature export
+    scripts/quantize_features.py   # Saved feature loading and validation
+    docs/experiment1.md            # Baseline results
+src/
+  vit_compression_lab/             # Shared Python code, added when needed
+  images/test1.jpg                 # Existing Qwen test image
+scripts/                          # Shared utilities, when needed
+configs/                          # Experiment settings
+tests/                           # Package checks
+outputs/                          # Local generated artifacts (ignored)
 ```
 
-## Setup
+Keep encoder-specific scripts and notes together under `encoders/<encoder>/`.
+Introduce shared functions only when experiments need them; no common model
+interface or training framework is required.
 
-Use Python 3.11 or newer:
+## Running the current experiments
+
+Run from the repository root with your existing virtual environment activated:
+
+```sh
+python encoders/Qwen3.8-vision-compression/scripts/experiment.py
+python encoders/Qwen3.8-vision-compression/scripts/quantize_features.py
+```
+
+The encoder script loads the model, benchmarks the vision encoder, and exports
+`outputs/features.pt`. The quantization script currently loads and validates
+that tensor; quantization is still being developed. These scripts use paths
+relative to the repository root.
+
+## Environment and checks
+
+Use Python 3.11 or newer. Research dependencies are listed in `requirements.txt`;
+choose versions compatible with your hardware. Package runtime dependencies are
+kept empty so adding another encoder does not impose its dependencies on others.
+
+For a fresh development environment:
 
 ```sh
 python -m venv .venv
@@ -32,34 +53,22 @@ source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
 
-Runtime dependencies are intentionally empty. Install compatible research
-dependencies after choosing your execution hardware. If local architecture
-changes become necessary, a separate Transformers checkout can later be installed
-in editable mode using `python -m pip install -e /path/to/your/transformers-checkout`;
-replace that example path with the checkout's actual location.
-
-## Checks
-
-After installation:
+Run available checks with:
 
 ```sh
 python -m pytest
-python -m ruff check .
-python -m ruff format --check .
+python -m ruff check src/vit_compression_lab tests
+python -m ruff format --check src/vit_compression_lab tests
 ```
 
-The single smoke test checks that the package imports.
+## Research artifacts
 
-## Learning sequence
+Keep weights in an external model cache. Generated tensors, checkpoints, and
+reports belong in ignored directories such as `outputs/`, `checkpoints/`, or
+`runs/`. For future runs, use encoder-specific output directories such as
+`outputs/<encoder>/<experiment>/` to avoid collisions. Existing scripts retain
+`outputs/features.pt` until that change is made explicitly.
 
-Manually implement loading → inspect feature shapes → measure an unmodified
-baseline → explore compression → fine-tune or distill.
-
-Keep downloaded pretrained weights in an external model cache, outside this
-repository. Put generated checkpoints and measurements in ignored local
-directories such as `checkpoints/` and `outputs/`. Root-level `data/`, `runs/`,
-and `artifacts/` are also ignored.
-
-When experiments begin, record the model revision, dependency versions,
-preprocessing settings, hardware, dtype, and attention backend so results can be
-understood and reproduced.
+Record model revisions, dependency versions, preprocessing, hardware, dtype,
+and attention backend alongside results. Numerical reconstruction error and
+downstream answer quality should be evaluated separately.

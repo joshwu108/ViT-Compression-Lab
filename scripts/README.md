@@ -1,9 +1,8 @@
-# Future scripts
+# Shared scripts
 
-Suggested scripts to write yourself later:
+Place utilities used across encoders here when needed. Encoder-specific scripts
+live under `encoders/<encoder>/scripts/`; the current Qwen scripts are in
+`encoders/Qwen3.8-vision-compression/scripts/`.
 
-- `inspect_features.py`: Inspect the shapes of features produced by your chosen vision encoder.
-- `benchmark.py`: Measure an unmodified baseline on your chosen hardware.
-- `train.py`: Run your fine-tuning or distillation experiments when ready.
-
-No script implementations are included.
+Run scripts from the repository root so relative input and output paths resolve
+consistently. Do not add a shared framework before experiments need one.

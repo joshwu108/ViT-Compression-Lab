@@ -4,6 +4,7 @@ from transformers import (
     AutoProcessor,
     Qwen3_5ForConditionalGeneration,
 )
+from pathlib import Path
 from PIL import Image
 
 checkpoint = "Qwen/Qwen3.8-27B"
@@ -68,6 +69,11 @@ median_ms, p95_ms, p99_ms = torch.quantile(
 ).tolist()
 
 features = output.pooler_output
+output_path = Path("outputs/features.pt")
+output_path.parent.mkdir(parents=True, exist_ok=True)
+# detatch the tensors from gradient tracking and save it, copys GPU mem to CPU mem
+features_cpu = features.detach().cpu()
+torch.save(features_cpu, output_path)
 
 print(f"Encoder latency ({measurement_runs} runs, {warmup_runs} warmups):")
 print(f"  Mean:   {latencies.mean().item():.3f} ms")

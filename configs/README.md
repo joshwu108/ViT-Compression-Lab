@@ -1,5 +1,5 @@
 # Experiment settings
 
-Keep experiment settings here as you begin writing experiments. Record the
-settings each experiment uses; choose a format when it becomes useful. This
-scaffold does not define hyperparameters or a configuration framework.
+Keep settings here as experiments need them, grouped by encoder when useful
+(for example, `configs/qwen3_8/`). Record the settings used alongside each result.
+Choose a file format when needed; no configuration framework is required.
