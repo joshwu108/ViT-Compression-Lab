@@ -11,11 +11,16 @@ encoders/
   Qwen3.8-vision-compression/
     scripts/experiment.py          # Vision encoder latency and feature export
     scripts/quantize_features.py   # Saved feature loading and validation
+    scripts/inject_eval.py         # Original vs INT8 features through the same model
+    scripts/score_results.py       # Answer scoring (primary rules + official VQA accuracy)
+    scripts/report_retention.py    # Retention, bootstrap bounds, decision, Markdown report
     docs/experiment1.md            # Baseline results
+    docs/experiment2.md            # 70-question pilot
+    docs/experiment2-large-eval.md # 3,000-question retention evaluation
 src/
-  vit_compression_lab/             # Shared Python code, added when needed
+  vit_compression_lab/             # INT8 codec, sampling, paired statistics, checkpointing
   images/test1.jpg                 # Existing Qwen test image
-scripts/                          # Shared utilities, when needed
+scripts/                          # Dataset preparation and VQA accuracy scoring
 configs/                          # Experiment settings
 tests/                           # Package checks
 outputs/                          # Local generated artifacts (ignored)
