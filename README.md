@@ -17,8 +17,9 @@ encoders/
     docs/experiment1.md            # Baseline results
     docs/experiment2.md            # 70-question pilot
     docs/experiment2-large-eval.md # 3,000-question retention evaluation
+    docs/experiment3.md            # INT4: outlier channels and group scaling
 src/
-  vit_compression_lab/             # INT8 codec, sampling, paired statistics, checkpointing
+  vit_compression_lab/             # INT8/INT4 codecs, sampling, paired statistics, checkpointing
   images/test1.jpg                 # Existing Qwen test image
 scripts/                          # Dataset preparation and VQA accuracy scoring
 configs/                          # Experiment settings

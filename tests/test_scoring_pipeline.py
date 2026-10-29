@@ -50,7 +50,7 @@ def record(i, dataset, task, answer_original, answer_compressed, expected, accep
         },
         "sizes": {
             "original_raw_bytes": 64,
-            "int8_raw_bytes": 32,
+            "quantized_raw_bytes": 32,
             "scale_raw_bytes": 16,
             "compressed_raw_bytes": 48,
             "original_serialized_bytes": 100,

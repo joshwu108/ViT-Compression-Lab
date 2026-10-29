@@ -17,6 +17,7 @@ score_results.py. Long runs append one line per example to results.jsonl and
 can be continued with --resume, which refuses to continue if the model
 revision, prompt, generation settings, compression codec, or manifests differ.
 Failed examples are recorded in failures.jsonl and retried on resume.
+--compression selects the codec for the compressed condition (int8 or int4).
 """
 
 import argparse
@@ -44,13 +45,10 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+from vit_compression_lab.codecs import CODEC_NAMES, get_codec  # noqa: E402
 from vit_compression_lab.int8_codec import (  # noqa: E402
-    dequantize,
-    deserialize,
-    quantize,
     raw_bytes,
     reconstruction_errors,
-    serialize,
 )
 from vit_compression_lab.run_checkpoint import (  # noqa: E402
     ResumeError,
@@ -253,42 +251,43 @@ def check_identity(model, inputs, generation_config):
     return features, reference_logits, report
 
 
-def measure_codec(features, grid_thw, device, runs, warmups):
-    """Phases 3-4: INT8 round trip, each stage timed separately. Returns restored features."""
+def measure_codec(codec, features, grid_thw, device, runs, warmups):
+    """Phases 3-4: codec round trip, each stage timed separately. Returns restored features."""
     timings = {}
-    # GPU quantization; timing includes the BF16 -> FP32 cast inside quantize().
+    shape = list(features.shape)
+    # GPU quantization; timing includes the BF16 -> FP32 cast (and INT4 packing) inside quantize().
     (q, scale), timings["gpu_quantize"] = gpu_time(
-        lambda: quantize(features), device, runs, warmups)
-    (q_cpu, scale_cpu), timings["transfer_d2h_int8_and_scales"] = gpu_time(
+        lambda: codec.quantize(features), device, runs, warmups)
+    (q_cpu, scale_cpu), timings["transfer_d2h_quantized_and_scales"] = gpu_time(
         lambda: (q.cpu(), scale.cpu()), device, runs, warmups)
     payload, timings["cpu_serialize"] = cpu_time(
-        lambda: serialize(q_cpu, scale_cpu, features.dtype, grid_thw), runs, warmups)
-    (q2, scale2, dtype, shape, grid2), timings["cpu_deserialize"] = cpu_time(
-        lambda: deserialize(payload), runs, warmups)
-    (q_gpu, scale_gpu), timings["transfer_h2d_int8_and_scales"] = gpu_time(
+        lambda: codec.serialize(q_cpu, scale_cpu, features.dtype, shape, grid_thw), runs, warmups)
+    (q2, scale2, dtype, shape2, grid2), timings["cpu_deserialize"] = cpu_time(
+        lambda: codec.deserialize(payload), runs, warmups)
+    (q_gpu, scale_gpu), timings["transfer_h2d_quantized_and_scales"] = gpu_time(
         lambda: (q2.to(device), scale2.to(device)), device, runs, warmups)
     restored, timings["gpu_reconstruct"] = gpu_time(
-        lambda: dequantize(q_gpu, scale_gpu, dtype), device, runs, warmups)
+        lambda: codec.dequantize(q_gpu, scale_gpu, dtype), device, runs, warmups)
 
     # CPU variant, for continuity with experiment1 (original BF16 copied to CPU first).
     features_cpu, timings["transfer_d2h_original_bf16"] = gpu_time(
         lambda: features.cpu(), device, runs, warmups)
     (q_c, scale_c), timings["cpu_quantize"] = cpu_time(
-        lambda: quantize(features_cpu), runs, warmups)
+        lambda: codec.quantize(features_cpu), runs, warmups)
     _, timings["cpu_reconstruct"] = cpu_time(
-        lambda: dequantize(q_c, scale_c, features.dtype), runs, warmups)
+        lambda: codec.dequantize(q_c, scale_c, features.dtype), runs, warmups)
 
-    if shape != list(features.shape) or dtype != features.dtype or grid2 != grid_thw:
+    if list(shape2) != shape or dtype != features.dtype or grid2 != grid_thw:
         raise RuntimeError("Deserialized metadata does not match the original features")
     if restored.shape != features.shape or restored.dtype != features.dtype:
         raise RuntimeError("Reconstruction has the wrong shape or dtype")
-    if not torch.equal(restored, dequantize(q, scale, features.dtype)):
+    if not torch.equal(restored, codec.dequantize(q, scale, features.dtype)):
         raise RuntimeError("Serialized round trip changed the reconstruction")
 
     original_serialized = len(serialize_original(features_cpu))
     sizes = {
         "original_raw_bytes": raw_bytes(features),
-        "int8_raw_bytes": raw_bytes(q),
+        "quantized_raw_bytes": raw_bytes(q),
         "scale_raw_bytes": raw_bytes(scale),
         "compressed_raw_bytes": raw_bytes(q) + raw_bytes(scale),
         "original_serialized_bytes": original_serialized,
@@ -315,7 +314,7 @@ def timed_generation(model, kwargs, generation_config, device, eos_ids):
     return new_ids, {**timing, "output_tokens": new_ids.numel(), "hit_token_limit": hit_limit}
 
 
-def evaluate_example(row, model, processor, generation_config, device, args):
+def evaluate_example(row, model, processor, generation_config, device, args, codec):
     with Image.open(row["image_path"]) as source:
         image = source.convert("RGB")
     inputs_cpu, preprocess_timing = cpu_time(
@@ -334,7 +333,7 @@ def evaluate_example(row, model, processor, generation_config, device, args):
         _, encoder_timing = gpu_time(
             lambda: encode_image(model, inputs), device, args.encoder_runs, args.warmups)
         restored, payload, codec_timings, sizes = measure_codec(
-            features, grid_thw, device, args.runs, args.warmups)
+            codec, features, grid_thw, device, args.runs, args.warmups)
 
         # The compressed path must consume exactly `restored`, not the original features.
         if torch.equal(restored, features):
@@ -364,6 +363,7 @@ def evaluate_example(row, model, processor, generation_config, device, args):
         "prompt_tokens": inputs["input_ids"].shape[1],
         "feature_shape": list(features.shape),
         "feature_dtype": str(features.dtype),
+        "compression": codec.name,
         "identity_check": identity,
         "compressed_prefill_max_abs_logit_diff":
             (compressed_logits - original_logits).abs().max().item(),
@@ -442,9 +442,9 @@ def describe_run(args, model, processor, generation_config, device):
     }
 
 
-def run_fingerprint(args, model, processor, generation_config, device, rows, run_info):
+def run_fingerprint(args, codec, model, processor, generation_config, device, rows, run_info):
     """Settings that must match for --resume. Timing and output options are excluded."""
-    codec_path = REPO_ROOT / "src" / "vit_compression_lab" / "int8_codec.py"
+    codec_path = REPO_ROOT / "src" / "vit_compression_lab" / codec.file
     return {
         "checkpoint": args.checkpoint,
         "revision": args.revision,
@@ -455,7 +455,7 @@ def run_fingerprint(args, model, processor, generation_config, device, rows, run
         "prompt": {"answer_instruction": ANSWER_INSTRUCTION, "enable_thinking": False},
         "generation_config": generation_config.to_diff_dict(),
         "image_processor": processor.image_processor.to_dict(),
-        "compression": {"scheme": "symmetric per-token INT8, FP32 scales (int8_codec.py)",
+        "compression": {"name": codec.name, "scheme": codec.scheme,
                         "codec_sha256": sha256_file(codec_path)},
         "manifests": [{"path": str(p), "sha256": sha256_file(p)} for p in args.manifests],
         "examples": {"count": len(rows),
@@ -490,10 +490,13 @@ def main():
                         help="runs=1, warmups=0, encoder-runs=1: no repeated latency "
                              "measurement; quality checks are unchanged")
     parser.add_argument("--skip-payloads", action="store_true",
-                        help="Do not save payloads/<id>.pt (about 3.4 MB per example)")
+                        help="Do not save payloads/<id>.pt (1.7-3.4 MB per example)")
+    parser.add_argument("--compression", choices=CODEC_NAMES, default="int8",
+                        help="Feature codec for the compressed condition (default int8)")
     parser.add_argument("--max-failures", type=int, default=10,
                         help="Stop after this many failed examples in one session")
     args = parser.parse_args()
+    codec = get_codec(args.compression)
 
     rows = load_manifests(args.manifests, args.ids)
     if args.limit is not None:
@@ -528,7 +531,8 @@ def main():
     )
 
     run_info = describe_run(args, model, processor, generation_config, device)
-    fingerprint = run_fingerprint(args, model, processor, generation_config, device, rows, run_info)
+    fingerprint = run_fingerprint(args, codec, model, processor, generation_config, device,
+                                  rows, run_info)
     if args.resume:
         try:
             completed, repaired = check_resume(args.output_dir, fingerprint)
@@ -560,7 +564,8 @@ def main():
     for index, row in enumerate(pending, 1):
         example_start = time.time()
         try:
-            record, payload = evaluate_example(row, model, processor, generation_config, device, args)
+            record, payload = evaluate_example(row, model, processor, generation_config, device,
+                                               args, codec)
         except Exception as error:  # recorded; the example stays pending for a resume
             failures += 1
             append_record(args.output_dir / "failures.jsonl", {
