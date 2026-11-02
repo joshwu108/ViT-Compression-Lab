@@ -1,8 +1,6 @@
 # ViT-compression-lab
 
 A learning-focused research repository for compression of vision encoder
-features. Qwen3.8 is the first encoder under study; other encoders can have
-independent experiments alongside it.
 
 ## Layout
 
