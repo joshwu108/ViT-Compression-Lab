@@ -1,0 +1,13 @@
+{
+  "name": "c_merger_gridconv_beta0.08",
+  "split": {"encoder_input": "merger", "decoder_target": "merger"},
+  "encoder": {"type": "grid_conv", "hidden": 512, "latent_channels": 192, "num_down": 0, "num_layers": 2, "kernel": 3, "gdn": true},
+  "decoder": {"type": "mirror", "hidden": 512, "kernel": 3, "gdn": true},
+  "distortion": {"type": "standardized_mse", "reduction": "sum_per_image"},
+  "rate": {"beta": 0.08, "reduction": "sum_per_image"},
+  "training": {"epochs": 10, "max_patches_per_batch": 12288},
+  "data": {"train_manifests": ["data/train-images/manifest.jsonl"],
+           "val_manifests": ["data/train-images/val_manifest.jsonl"], "val_limit": 64,
+           "feature_cache": "outputs/qwen3.8/teacher-features/train-images",
+           "channel_stats": "outputs/qwen3.8/teacher-features/train-images/channel_stats.pt"}
+}

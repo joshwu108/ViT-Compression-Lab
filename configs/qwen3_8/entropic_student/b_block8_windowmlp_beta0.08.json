@@ -1,0 +1,14 @@
+{
+  "name": "b_block8_windowmlp_beta0.08",
+  "split": {"encoder_input": "block_8", "decoder_target": "block_8"},
+  "encoder": {"type": "window_mlp", "hidden": 1024, "latent_channels": 192, "gdn": true},
+  "decoder": {"type": "mirror", "hidden": 1024, "gdn": true},
+  "distortion": {"type": "mse", "reduction": "sum_per_image"},
+  "deep_supervision": [{"point": "merger", "weight": 1.0, "type": "standardized_mse"}],
+  "rate": {"beta": 0.08, "reduction": "sum_per_image"},
+  "training": {"epochs": 10, "max_patches_per_batch": 8192, "num_workers": 4},
+  "data": {"train_manifests": ["data/train-images/manifest.jsonl"],
+           "val_manifests": ["data/train-images/val_manifest.jsonl"], "val_limit": 64,
+           "feature_cache": "outputs/qwen3.8/teacher-features/train-images",
+           "channel_stats": "outputs/qwen3.8/teacher-features/train-images/channel_stats.pt"}
+}

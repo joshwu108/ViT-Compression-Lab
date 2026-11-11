@@ -16,11 +16,15 @@ encoders/
     docs/experiment2.md            # 70-question pilot
     docs/experiment2-large-eval.md # 3,000-question retention evaluation
     docs/experiment3.md            # INT4: outlier channels and group scaling
+    docs/entropic-student-plan.md  # Learned compression (Entropic Student) design
+    docs/entropic-student-usage.md # How the learned pipeline is meant to be run
+    scripts/es_*.py                # Entropic Student: probe, extract, train, evaluate
 src/
   vit_compression_lab/             # INT8/INT4 codecs, sampling, paired statistics, checkpointing
+    entropic/                      # Learned entropy-coded compression (model-agnostic + qwen/)
   images/test1.jpg                 # Existing Qwen test image
 scripts/                          # Dataset preparation and VQA accuracy scoring
-configs/                          # Experiment settings
+configs/                          # Experiment settings (qwen3_8/entropic_student/ for learned runs)
 tests/                           # Package checks
 outputs/                          # Local generated artifacts (ignored)
 ```
@@ -76,3 +80,15 @@ reports belong in ignored directories such as `outputs/`, `checkpoints/`, or
 Record model revisions, dependency versions, preprocessing, hardware, dtype,
 and attention backend alongside results. Numerical reconstruction error and
 downstream answer quality should be evaluated separately.
+
+## Learned compression (Entropic Student)
+
+`src/vit_compression_lab/entropic/` adapts Matsubara et al. (WACV 2022) to the
+Qwen3.5-family vision tower of `Qwen/Qwen3.8-27B`: a student encoder, a learned
+factorised entropy model with rANS coding, and a decoder that reconstructs the
+teacher activation at a configurable split point (`pixels`, `block_k`, or
+`merger`). The design, split-point analysis and open risks are in
+`encoders/Qwen3.8-vision-compression/docs/entropic-student-plan.md`; the
+intended command sequence is in `docs/entropic-student-usage.md`. As of this
+writing the code has been written but **not executed**: no training, no
+inference, no tests. Training images are not part of the repository.

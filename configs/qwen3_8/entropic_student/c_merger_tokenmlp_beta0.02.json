@@ -1,0 +1,20 @@
+{
+  "name": "c_merger_tokenmlp_beta0.02",
+  "split": {"encoder_input": "merger", "decoder_target": "merger"},
+  "encoder": {"type": "token_mlp", "hidden": 1024, "latent_channels": 256, "gdn": true},
+  "decoder": {"type": "mirror", "hidden": 1024, "gdn": true},
+  "entropy": {"type": "factorized", "filters": [3, 3, 3], "init_scale": 10.0, "tail_mass": 1e-9},
+  "quantization": {"train": "noise", "eval": "round"},
+  "distortion": {"type": "standardized_mse", "reduction": "sum_per_image", "cosine_weight": 0.0},
+  "deep_supervision": [],
+  "rate": {"beta": 0.02, "reduction": "sum_per_image"},
+  "training": {"epochs": 10, "lr": 0.001, "aux_lr": 0.001, "milestones": [5, 8], "gamma": 0.1,
+               "grad_clip": 1.0, "max_patches_per_batch": 16384, "seed": 0, "log_every": 20, "num_workers": 4},
+  "data": {"train_manifests": ["data/train-images/manifest.jsonl"],
+           "val_manifests": ["data/train-images/val_manifest.jsonl"],
+           "train_limit": null, "val_limit": 64,
+           "feature_cache": "outputs/qwen3.8/teacher-features/train-images",
+           "channel_stats": "outputs/qwen3.8/teacher-features/train-images/channel_stats.pt"},
+  "stage2": {"alpha": 0.0, "tau": 1.0, "lr": 0.0001, "epochs": 1, "train_server_suffix": false,
+             "answer_source": "teacher_greedy", "max_new_tokens": 32, "grad_checkpointing": true}
+}
