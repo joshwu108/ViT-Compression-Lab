@@ -70,10 +70,14 @@ def vision_state_dict(checkpoint, revision):
 
 def load_vision_tower(checkpoint, revision, device="cpu", dtype=torch.bfloat16,
                       attn_implementation="sdpa"):
-    """Frozen ``Qwen3_5VisionModel`` with the checkpoint's weights, nothing else loaded."""
+    """Frozen ``Qwen3_5VisionModel`` with the checkpoint's weights"""
+
+    # extract the Qwen3_5 config set attention implementation
     config = load_config(checkpoint, revision)
     vision_config = config.vision_config
     vision_config._attn_implementation = attn_implementation
+
+    # construct vision network from extracted settings
     model = Qwen3_5VisionModel(vision_config)
     missing, unexpected = model.load_state_dict(vision_state_dict(checkpoint, revision), strict=False)
     if unexpected:
@@ -82,6 +86,8 @@ def load_vision_tower(checkpoint, revision, device="cpu", dtype=torch.bfloat16,
     real_missing = [k for k in missing if not k.endswith("inv_freq")]
     if real_missing:
         raise RuntimeError(f"Missing vision tensors: {real_missing[:5]}")
+
+    # set model device, prceision, and evaluation mode
     model = model.to(device=device, dtype=dtype).eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -119,6 +125,8 @@ class TeacherSplit:
     def geometry(self, grid_thw):
         visual = self.visual
         grid_thw = grid_thw.to(self.device)
+
+        # function from transformer library
         interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
             grid_thw,
             num_grid_per_side=visual.num_grid_per_side,
@@ -126,27 +134,31 @@ class TeacherSplit:
             align_corners=visual.interpolation_align_corners,
             spatial_merge_size=visual.config.spatial_merge_size,
         )
+        # get the positional information
         position_ids = get_vision_position_ids(grid_thw, visual.spatial_merge_size)
+        # get the cumulative and maximum lengths for attention sequences
         cu_seqlens, max_seqlen = get_vision_attention_seqlens(grid_thw, visual.config)
         anchor = torch.empty(0, device=self.device)
+        # include cosine and sine tensors for spatial position within attention
         position_embeddings = visual.rotary_pos_emb(anchor, position_ids)
         return Geometry(interp_indices, interp_weights, cu_seqlens, max_seqlen, position_embeddings)
 
     def stem(self, pixel_values, geo):
-        visual = self.visual
-        hidden = visual.patch_embed(pixel_values.to(self.device))
-        pos = (visual.pos_embed(geo.interp_indices) * geo.interp_weights[:, :, None]).sum(1)
+        # attain the patch embeddings + positional information
+        hidden = self.visual.patch_embed(pixel_values.to(self.device))
+        # use the object's interp_indices table to determine the positions
+        pos = (self.visual.pos_embed(geo.interp_indices) * geo.interp_weights[:, :, None]).sum(1)
         return hidden + pos.to(hidden.dtype)
 
     def run_blocks(self, hidden, start, stop, geo):
-        """Apply blocks[start:stop] (0-based module indices)."""
+        """Apply blocks[start:stop]"""
         for blk in self.visual.blocks[start:stop]:
             hidden = blk(hidden, cu_seqlens=geo.cu_seqlens, max_seqlen=geo.max_seqlen,
                          position_embeddings=geo.position_embeddings)
         return hidden
 
     def prefix(self, pixel_values, grid_thw, depth, geo=None):
-        """Activation at ``depth`` (-1 pixels, 0 stem, k block k, depth+1 merger)."""
+        """Request input from start to depth(input itself, merger output, block output)"""
         if depth == -1:
             return pixel_values
         geo = geo or self.geometry(grid_thw)

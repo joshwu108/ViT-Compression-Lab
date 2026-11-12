@@ -29,6 +29,16 @@ LEVEL_SCALE = {("patch", "patch"): 1.0, ("token", "token"): 1.0,
 
 
 def _mlp(d_in, hidden, d_out, gdn, inverse, pre_norm):
+    """
+    Builds a small neural network
+
+    d_in - input width
+    hidden - hidden width
+    d_out - output width
+    pre_norm - whether or not prenormalize the 
+        input vectors across channels
+    inverse - inverse GDN or not (encoder vs decoder)
+    """
     layers = []
     if pre_norm:
         layers.append(nn.LayerNorm(d_in))
@@ -41,6 +51,7 @@ def _mlp(d_in, hidden, d_out, gdn, inverse, pre_norm):
 # ------------------------------------------------------------------ MLP family
 
 class TokenMLPEncoder(nn.Module):
+    """Compresses each token's channel vector"""
     family = "token_mlp"
 
     def __init__(self, d_in, hidden, latent, level, gdn=True, pre_norm=True):
@@ -49,6 +60,7 @@ class TokenMLPEncoder(nn.Module):
         self.net = _mlp(d_in, hidden, latent, gdn, inverse=False, pre_norm=pre_norm)
 
     def forward(self, u, grid_thw):
+        # passes every token thorugh the neural network
         return self.net(u)
 
     def latent_counts(self, grid_thw):
@@ -304,7 +316,7 @@ def build_decoder(cfg, encoder, latent, d_out, out_level):
 
 
 class EntropicStudent(nn.Module):
-    """stem? -> body? -> encoder -> entropy model -> decoder."""
+    """stem -> body -> encoder -> entropy model -> decoder."""
 
     def __init__(self, config: StudentConfig, dims: VisionDims | None = None):
         super().__init__()

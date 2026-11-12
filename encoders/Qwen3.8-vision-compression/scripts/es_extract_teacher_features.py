@@ -1,16 +1,13 @@
-"""Cache frozen-teacher activations at chosen split points (vision tower only).
+"""Cache frozen-teacher activations at chosen split points.
 
-Loads just the Qwen3.5 vision tower from the local checkpoint cache (no LLM,
-no download), runs each manifest image once, and stores pixel values, grid and
+Loads just the Qwen3.5 vision tower from the local checkpoint cache, 
+runs each manifest image once, and stores pixel values, grid and
 the requested activations as one safetensors file per example. Also
 accumulates per-channel mean/std per point for the standardised distortion.
 
     python encoders/Qwen3.8-vision-compression/scripts/es_extract_teacher_features.py \
         data/train/manifest.jsonl --points block_16 merger \
         --cache-dir outputs/qwen3.8/teacher-features/train
-
-Points: pixels, block_0 (stem) .. block_27, merger. Activations are stored in
-the teacher dtype (BF16). Nothing is downloaded.
 """
 
 import argparse
@@ -36,10 +33,19 @@ from vit_compression_lab.run_checkpoint import write_json  # noqa: E402
 
 
 class ChannelStats:
+    """
+    Calculates the mean and standard devition of each feature channel
+    """
     def __init__(self):
+        """
+        self.sum - sum of observed values
+        slef.sumsq - sum of squared values
+        self.count - number of observed feature rows
+        """
         self.sum, self.sumsq, self.count = {}, {}, {}
 
     def add(self, point, x):
+        """add a tensor on to a specific key/point"""
         x = x.double()
         self.sum[point] = self.sum.get(point, 0) + x.sum(0)
         self.sumsq[point] = self.sumsq.get(point, 0) + x.pow(2).sum(0)
@@ -56,6 +62,8 @@ class ChannelStats:
 
 
 def main():
+
+    # set up parser + add arguments
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("manifests", type=Path, nargs="+")
@@ -71,9 +79,9 @@ def main():
                         help="Check suffix(prefix(d)) against the full forward on the first image")
     args = parser.parse_args()
 
-    rows = read_manifest(args.manifests, limit=args.limit)
-    processor = load_processor(args.checkpoint, args.revision)
-    visual = load_vision_tower(args.checkpoint, args.revision, device=args.device)
+    rows = read_manifest(args.manifests, limit=args.limit) # extract manifest data
+    processor = load_processor(args.checkpoint, args.revision) #load model settings from transformers library
+    visual = load_vision_tower(args.checkpoint, args.revision, device=args.device) # fetch vision model
     split = TeacherSplit(visual)
     for point in args.points:
         split.depth_of(point)  # validates names
@@ -116,6 +124,8 @@ def main():
         info["channel_stats"] = {p: {"count": v["count"], "std_max": v["std"].max().item(),
                                      "std_median": v["std"].median().item()} for p, v in result.items()}
     info["finished_at"] = time.time()
+
+    # save the outputs from the feature extraction
     write_json(args.cache_dir / "extraction_info.json", info)
     print(json.dumps({k: v for k, v in info.items() if k != "verification"}, indent=2, default=str))
 
