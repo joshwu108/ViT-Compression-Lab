@@ -83,6 +83,8 @@ class ServerSuffix:
 
 
 def main():
+
+    # parse arguments
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--student-checkpoint", type=Path, required=True)
@@ -101,6 +103,7 @@ def main():
     torch.cuda.set_device(device)
     ie = load_inject_eval()
 
+    # load checkpoint and entropic student
     ckpt = load_checkpoint(args.student_checkpoint, map_location=device)
     student, config = student_from_checkpoint(ckpt)
     student = student.to(device)
@@ -130,14 +133,17 @@ def main():
     eos_ids = set(defaults.eos_token_id if isinstance(defaults.eos_token_id, list) else [defaults.eos_token_id])
 
     split = TeacherSplit(model.model.visual)
-    sp = config.split
+    sp = config.split # settings
     in_depth, tgt_depth = sp.input_depth(split.dims), sp.target_depth(split.dims)
     suffix = ServerSuffix(split, tgt_depth, s2["train_server_suffix"])
 
-    params = [p for p in student.decoder.parameters() if p.requires_grad] + suffix.parameters()
+    # set up params, optimizer and read rows from manifests
+    params = [p for p in student.decoder.parameters() if p.requires_grad] + suffix.parameters() # what optimizer can update(decoder)
     optimizer = torch.optim.AdamW(params, lr=s2["lr"], weight_decay=0.0)
     rows = read_manifest(args.manifests, limit=args.limit, require_question=True)
     name = args.name or f"{config.name}-stage2"
+
+    # set up run directory
     run = RunDir(args.runs_dir, name, resume=args.resume)
     run.write_config(config)
     run.write_run_info({"stage": 2, "student_checkpoint": str(args.student_checkpoint), "stage2": s2,
@@ -150,12 +156,15 @@ def main():
         for row in rows:
             with Image.open(row["image_path"]) as source:
                 image = source.convert("RGB")
-            inputs = ie.build_inputs(processor, image, row["question"])
+
+            # construct teacher targets
+            inputs = ie.build_inputs(processor, image, row["question"]) # applkies chat and preprocesses image
             inputs = {k: v.to(device) for k, v in inputs.items()}
             grid = inputs["image_grid_thw"]
             with torch.no_grad():
-                h = ie.encode_image(model, inputs)
+                h = ie.encode_image(model, inputs) # teacher merger
                 if row["id"] in teacher_cache:
+                    # if image in cache
                     answer_ids, teacher_logits = teacher_cache[row["id"]]
                     teacher_logits = teacher_logits.to(device)
                 else:
@@ -172,20 +181,28 @@ def main():
                         continue
                     extended, mask, labels = teacher_forced_inputs(processor, inputs, answer_ids)
                     model.model.rope_deltas = None
+
+                    # produce reference vocabulary scores using original features
                     teacher_logits = model(**injected_kwargs(extended, h), use_cache=False).logits[mask].float()
                     teacher_cache[row["id"]] = (answer_ids, teacher_logits.to(torch.float16).cpu())
+
+                # append answer tokens and align prediction positions with next token target
                 extended, mask, labels = teacher_forced_inputs(processor, inputs, answer_ids)
                 geo = split.geometry(grid)
+                # get student input
                 u = split.prefix(inputs["pixel_values"].to(split.dtype), grid, in_depth, geo)
 
+            # encode, round, decodes
             out = student(u.float(), grid, quant_mode="round")
             h_hat = suffix(out["recon"], grid, geo).to(h.dtype)
             model.model.rope_deltas = None
+
+            # calculate loss + pass into model
             student_logits = model(**injected_kwargs(extended, h_hat), use_cache=False).logits[mask]
             loss, log = stage2_loss(student_logits, teacher_logits, labels[mask], torch.ones_like(labels[mask], dtype=torch.bool),
                                     alpha=s2["alpha"], tau=s2["tau"])
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            loss.backward() #backpropagate
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             optimizer.step()
             step += 1

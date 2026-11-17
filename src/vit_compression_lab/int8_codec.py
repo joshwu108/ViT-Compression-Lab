@@ -54,7 +54,7 @@ def raw_bytes(tensor):
 
 
 def reconstruction_errors(original, reconstructed):
-    """Diagnostics only; they do not measure task quality."""
+    """h_hat - h + normalization"""
     x = original.float()
     error = reconstructed.float() - x
     source_norm = torch.linalg.vector_norm(x).item()

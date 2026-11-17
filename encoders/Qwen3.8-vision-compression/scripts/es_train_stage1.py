@@ -1,7 +1,5 @@
 """Stage 1: rate–distortion training of the Entropic Student against the frozen teacher.
 
-    L_1 = 1/2 ||h - h_hat||^2 (+ deep supervision) - beta * log p(z + U(-1/2, 1/2))
-
 Only the vision tower is loaded (never the LLM). With a feature cache that
 holds the encoder input and the decoder target, and no deep-supervision terms,
 no teacher model is loaded at all (``--cache-only``).
@@ -71,28 +69,52 @@ def propagate(split, recon, grid_thw, from_depth, point, geo):
 
 
 def teacher_activations(split, batch, points, device):
+    """returns the intermediate feature tensors"""
+
+    # if required features cached in batch, move to device
     if all(p in batch["features"] for p in points):
         return {p: batch["features"][p].to(device) for p in points}
     if split is None:
         raise RuntimeError("Feature cache lacks required points and no teacher is loaded")
+
+    # run teacher to collect them
     with torch.no_grad():
         return split.collect(batch["pixel_values"].to(device, split.dtype), batch["grid_thw"].to(device), points)
 
 
 def run_batch(student, split, batch, config, points, channel_stats, device, train):
+    """
+    student - trainiable EntropicStudent in bottleneck.py
+    split - access to frozen teacher's vision layers
+    batch - data for the group of images with their grids and cached features
+    config - settings for splits, student, quantization, and loss
+    points - names of teacher feature locations needed for configuration
+    channel_stats - channel standard deviations used to normalize reconstruction errors
+    device - where computation runs
+    train - whether for training or evaluation
+    """
+
+    # move image layout information to the GPU and fetch teacher activations
     grid = batch["grid_thw"].to(device)
     acts = teacher_activations(split, batch, points, device)
-    sp = config.split
-    u = acts[sp.encoder_input].float()
+    sp = config.split # config settings for student encoder
+
+    # look up the teacher features at student input location
+    u = acts[sp.encoder_input].float() #[total tokens, 5120]
     n_visual_tokens = sum(token_counts(grid))
     geo = split.geometry(grid) if (split is not None and config["deep_supervision"]) else None
+
+    # run student with input, grid
     out = student(u, grid, quant_mode=None if train else "round")
     out["deep"] = {}
     for term in config["deep_supervision"]:
         out["deep"][term["point"]] = propagate(split, out["recon"], grid, sp.target_depth(split.dims),
                                                term["point"], geo)
+    # count features at patch and token resolutions
     counts_by_level = {lvl: counts_for_level(grid, lvl) for lvl in ("patch", "token")}
     targets = {p: acts[p].float() for p in points}
+
+    # clalculate the training objective
     loss, log = stage1_loss(out, targets, counts_by_level, n_visual_tokens, config, channel_stats)
     return loss, log, out, acts, grid
 
@@ -101,6 +123,8 @@ def run_batch(student, split, batch, config, points, channel_stats, device, trai
 def evaluate(student, split, loader, config, points, channel_stats, device, coded_examples):
     student.eval()
     logs, coded = [], []
+
+    # run model for each batch of images
     for batch in loader:
         loss, log, out, acts, grid = run_batch(student, split, batch, config, points, channel_stats, device, False)
         entry = {k: float(v) for k, v in log.items()}
@@ -135,6 +159,8 @@ def evaluate(student, split, loader, config, points, channel_stats, device, code
 
 
 def main():
+
+    # argument parsing
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, required=True)
@@ -151,16 +177,16 @@ def main():
 
     device = torch.device(args.device)
     config = StudentConfig.load(args.config)
-    tr = config["training"]
+    training_config = config["training"]
     if args.epochs is not None:
-        tr["epochs"] = args.epochs
+        training_config["epochs"] = args.epochs
     if args.limit is not None:
         config.raw["data"]["train_limit"] = args.limit
-    torch.manual_seed(tr["seed"])
+    torch.manual_seed(training_config["seed"])
 
-    teacher = config["teacher"]
-    processor = load_processor(teacher["checkpoint"], teacher["revision"])
-    points = needed_points(config)
+    teacher = config["teacher"] # extract the teacher mdoel
+    processor = load_processor(teacher["checkpoint"], teacher["revision"]) # processor associated with that checkpoint
+    points = needed_points(config) # teacher feature locations needed
     split = None
     dims = VisionDims()
     if not args.cache_only:
@@ -175,8 +201,12 @@ def main():
     data = config["data"]
     if not data["train_manifests"]:
         parser.error("config.data.train_manifests is empty: no training images are in this repository")
+
+    # set up cache for tensors to be cached from teacher feature extraction
     cache = FeatureCache(data["feature_cache"]) if data["feature_cache"] else None
     cache_points = sorted(points) if (cache is not None and args.cache_only) else []
+
+    # read train + validation images from manifests
     train_rows = read_manifest(data["train_manifests"], limit=data["train_limit"])
     val_rows = read_manifest(data["val_manifests"], limit=data["val_limit"]) if data["val_manifests"] else []
     if cache is not None and not args.cache_only:
@@ -184,30 +214,43 @@ def main():
         cache_points = sorted(p for p in points if all(cache.has(r["id"]) for r in train_rows + val_rows))
 
     def make_loader(rows, shuffle):
-        dataset = ImageManifestDataset(rows, processor, cache, cache_points)
-        counts = [estimate_patch_count(r, processor) for r in rows]
-        sampler = PatchBudgetBatchSampler(counts, tr["max_patches_per_batch"], shuffle=shuffle, seed=tr["seed"])
+        """helper function to """
+        dataset = ImageManifestDataset(rows, processor, cache, cache_points) # defines how to extract image data
+        counts = [estimate_patch_count(r, processor) for r in rows] # defines the patches needed per image
+
+        # determines which indices belong in each batch
+        sampler = PatchBudgetBatchSampler(counts, training_config["max_patches_per_batch"], shuffle=shuffle, seed=tr["seed"])
         if sampler.dropped:
             print(f"{sampler.dropped} examples exceed max_patches_per_batch and are skipped")
-        return DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_packed,
-                          num_workers=tr["num_workers"]), sampler
 
+        # use pytorch module for DataLoader
+        return DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_packed,
+                          num_workers=training_config["num_workers"]), sampler
+
+    # create the loader
     train_loader, train_sampler = make_loader(train_rows, shuffle=True)
     val_loader = make_loader(val_rows, shuffle=False)[0] if val_rows else None
 
     channel_stats = None
     if data["channel_stats"]:
+        # load previously saved feature statistics
         stats = torch.load(data["channel_stats"], weights_only=False)
         channel_stats = {p: v["std"].to(device) for p, v in stats.items()}
 
+    # create the student model described in config
     student = EntropicStudent(config, dims).to(device)
-    main_opt = torch.optim.Adam(student.main_parameters(), lr=tr["lr"], weight_decay=tr["weight_decay"])
-    aux_opt = torch.optim.Adam(student.aux_parameters(), lr=tr["aux_lr"])
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(main_opt, milestones=tr["milestones"], gamma=tr["gamma"])
+
+    # optimizer for encoder, decoder, entropy distribution (objective = reconstruction error + rate penalty)
+    main_opt = torch.optim.Adam(student.main_parameters(), lr=training_config["lr"], weight_decay=training_config["weight_decay"])
+    # updates the qunatiles for student.entropy
+    aux_opt = torch.optim.Adam(student.aux_parameters(), lr=training_config["aux_lr"])
+    # schedules certain milestones where learning rate is reduced
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(main_opt, milestones=training_config["milestones"], gamma=training_config["gamma"])
 
     run = RunDir(args.runs_dir, config.name, resume=args.resume)
     start_epoch, step, best = 0, 0, math.inf
     if args.resume and run.checkpoint_path("latest").exists():
+        # restore existing run
         ckpt = load_checkpoint(run.checkpoint_path("latest"), map_location=device)
         student.load_state_dict(ckpt["state_dict"])
         main_opt.load_state_dict(ckpt["optimizers"]["main"])
@@ -226,30 +269,36 @@ def main():
             "val_examples": len(val_rows), "software": software_info(), "hardware": hardware_info(device),
         })
 
-    student.train()
-    for epoch in range(start_epoch, tr["epochs"]):
+    student.train() #enable training behavior
+    for epoch in range(start_epoch, training_config["epochs"]):
         train_sampler.set_epoch(epoch)
-        epoch_start = time.time()
+        epoch_start = time.time() #record start time
         for batch in train_loader:
+            # run student and compute main objective
             loss, log, _, _, _ = run_batch(student, split, batch, config, points, channel_stats, device, True)
             aux = student.entropy.aux_loss()
-            main_opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if tr["grad_clip"]:
-                torch.nn.utils.clip_grad_norm_(student.main_parameters(), tr["grad_clip"])
+            main_opt.zero_grad(set_to_none=True) #clear previous gradients
+            loss.backward() # compute gradients of loss with respect tio the main parameters
+            if training_config["grad_clip"]:
+                torch.nn.utils.clip_grad_norm_(student.main_parameters(), training_config["grad_clip"])
             main_opt.step()
+
+            # auxiliary parameters update
             aux_opt.zero_grad(set_to_none=True)
             aux.backward()
             aux_opt.step()
+
             step += 1
-            if step % tr["log_every"] == 0:
+            if step % training_config["log_every"] == 0:
                 run.log({"phase": "train", "epoch": epoch, "step": step, "lr": scheduler.get_last_lr()[0],
                          "aux_loss": aux.item(), **{k: float(v) for k, v in log.items()}})
                 print(f"epoch {epoch} step {step} loss {log['loss']:.4f} mse {log['mse']:.5f} "
                       f"bits/tok {log['bits_per_visual_token']:.1f}")
         scheduler.step()
         record = {"phase": "epoch", "epoch": epoch, "step": step, "seconds": time.time() - epoch_start}
-        if val_loader is not None and tr["eval_every_epoch"]:
+
+        # run evaluation
+        if val_loader is not None and training_config["eval_every_epoch"]:
             val = evaluate(student, split, val_loader, config, points, channel_stats, device, args.coded_examples)
             record["val"] = val
             score = val.get("loss", math.inf)
