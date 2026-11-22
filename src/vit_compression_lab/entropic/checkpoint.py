@@ -3,7 +3,7 @@
     runs/<name>/config.json          the resolved StudentConfig
     runs/<name>/run_info.json        software, hardware, teacher revision, parameter counts
     runs/<name>/metrics.jsonl        one JSON line per logged step or evaluation
-    runs/<name>/checkpoints/latest.pt, best.pt, epoch-XXX.pt
+    runs/<name>/checkpoints/latest.pt, best.pt, epoch-XXX.pt (step mode: step-XXXXXX.pt)
 
 A checkpoint holds the config, the student state dict (including the entropy
 model's integer CDF tables once update() has run), optimiser states, and the
@@ -93,15 +93,19 @@ def load_checkpoint(path, map_location="cpu"):
     return payload
 
 
-def student_from_checkpoint(payload, strict=True):
-    dims = VisionDims(**payload["dims"])
-    config = StudentConfig.from_dict(payload["config"], dims)
-    student = EntropicStudent(config, dims)
-    state = payload["state_dict"]
+def load_student_state(student, state, strict=True):
+    """load_state_dict for an existing student (e.g. the one the optimizers were built on)."""
     # Integer CDF tables are sized at update() time; resize buffers before loading.
     for name in ("_quantized_cdf", "_offset", "_cdf_length"):
         key = f"entropy.{name}"
         if key in state:
             getattr(student.entropy, name).resize_(state[key].shape)
-    student.load_state_dict(state, strict=strict)
+    return student.load_state_dict(state, strict=strict)
+
+
+def student_from_checkpoint(payload, strict=True):
+    dims = VisionDims(**payload["dims"])
+    config = StudentConfig.from_dict(payload["config"], dims)
+    student = EntropicStudent(config, dims)
+    load_student_state(student, payload["state_dict"], strict=strict)
     return student, config

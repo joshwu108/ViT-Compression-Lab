@@ -97,7 +97,12 @@ class FactorizedEntropyModel(nn.Module):
     # ---------------------------------------------------------- quantisation
 
     def quantize(self, z, mode):
-        """mode: 'noise' | 'ste' | 'round' | 'symbols'. Channel-last input."""
+        """mode: 'noise' | 'ste' | 'round' | 'symbols' | 'none'. Channel-last input.
+
+        'none' passes the float latent through unchanged. It is a diagnostic that
+        bypasses quantization; such latents cannot be entropy coded."""
+        if mode == "none":
+            return z
         if mode == "noise":
             return z + torch.empty_like(z).uniform_(-0.5, 0.5)
         medians = self.medians().to(z.dtype)

@@ -61,16 +61,22 @@ def main():
 
     records = []
     for row in rows:
+        # extract the patch inputs and temporal/height/width layout
         pixel_values, grid_thw = preprocess_image(processor, row["image_path"])
-        grid = grid_thw.to(device)
+        grid = grid_thw.to(device) # move grid to computational device
+
         with torch.inference_mode():
-            geo = split.geometry(grid)
+            geo = split.geometry(grid) # extract the positional + attention layout info
+
+            # run the teacher vision tower and get requuested feature points into dictionary
             acts = split.collect(pixel_values.to(device, split.dtype), grid, points)
-            h = acts[MERGER]
-            u = acts[sp.encoder_input].float()
-            out = student(u, grid, quant_mode="round")
+            h = acts[MERGER] # parent output
+            u = acts[sp.encoder_input].float() # student input
+            out = student(u, grid, quant_mode="round") # run the student encoder
             h_hat = split.suffix(out["recon"].to(split.dtype), grid, sp.target_depth(split.dims), geo)
             n_tokens = h.shape[0]
+
+            # ENCODING COST + RECONSTRUCTION QUALITY
             ideal_bits = -torch.log2(out["likelihood"]).sum().item()
             record = {
                 "id": row["id"], "grid_thw": grid_thw.tolist(), "visual_tokens": n_tokens,
@@ -80,6 +86,8 @@ def main():
                 "latent_shape": [sum(out["latent_counts"]), student.latent_channels],
                 "baselines": {},
             }
+
+            # optional entropy coding
             if not args.no_coding:
                 strings, counts, ideal = student.compress(u, grid)
                 header = payload_lib.make_header(sp, grid.cpu(), counts, student.latent_channels)

@@ -1,6 +1,11 @@
 import torch
 
 from vit_compression_lab.entropic.bottleneck import EntropicStudent, patch_coordinates
+from vit_compression_lab.entropic.checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+    student_from_checkpoint,
+)
 from vit_compression_lab.entropic.config import StudentConfig, VisionDims
 
 DIMS = VisionDims(depth=4, hidden_size=16, out_hidden_size=24, patch_size=2, temporal_patch_size=2)
@@ -78,4 +83,57 @@ def test_patch_coordinates_follow_merge_block_order():
     coords = patch_coordinates(torch.tensor([[1, 4, 4]]))
     assert coords.shape == (16, 2)
     # Packed patches 0..3 are the top-left window: rows {0,1}, cols {0,1} (normalised by 3).
-    assert set(coords[:4, 0].tolist()) == {0.0, 1 / 3} and set(coords[:4, 1].tolist()) == {0.0, 1 / 3}
+    # Coordinates are float32, so compare against the float32 value of 1/3 (not Python's double).
+    expected = torch.tensor([0.0, 1 / 3])
+    assert torch.equal(coords[:4, 0].unique(), expected) and torch.equal(coords[:4, 1].unique(), expected)
+
+
+def test_normalized_output_decoder_is_consistent_and_checkpointable(tmp_path):
+    torch.manual_seed(0)
+    student = make({"encoder_input": "merger", "decoder_target": "merger"},
+                   {"type": "token_mlp", "hidden": 8, "latent_channels": 4},
+                   {"decoder": {"type": "mirror", "hidden": 8, "gdn": True, "output": "normalized"}})
+    mean, std = torch.randn(24) * 5, torch.rand(24) + 0.5
+    student.set_output_stats(mean, std)
+    u = torch.randn(7, 24)
+
+    # forward(), decode() and decompress() all return teacher-scale features
+    student.eval()
+    out = student(u, GRID, quant_mode="round")
+    assert out["recon"].shape == (7, 24)
+    raw = student.decoder(out["z_hat"], GRID)
+    assert torch.allclose(out["recon"], mean + std * raw, atol=1e-6)
+    assert torch.equal(student.decode(out["z_hat"], GRID), out["recon"])
+    strings, _, _ = student.compress(u, GRID)
+    assert torch.allclose(student.decompress(strings, GRID), out["recon"], atol=1e-5)
+
+    # gradients reach the decoder and encoder, never the statistics
+    student.train()
+    student(u, GRID)["recon"].pow(2).sum().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in student.decoder.parameters())
+    assert all(p.grad is not None for p in student.encoder.parameters())
+    assert not student.output_mean.requires_grad and not student.output_std.requires_grad
+
+    # the statistics are checkpoint buffers: a reload needs no external stats file
+    student.eval()
+    save_checkpoint(tmp_path / "s.pt", student, 0, 0)
+    reloaded, _ = student_from_checkpoint(load_checkpoint(tmp_path / "s.pt"))
+    assert torch.equal(reloaded.output_mean, mean)
+    assert torch.allclose(reloaded.eval()(u, GRID, quant_mode="round")["recon"], out["recon"], atol=1e-6)
+
+
+def test_default_decoder_has_no_output_stats_and_mean_bias_init():
+    student = make({"encoder_input": "merger", "decoder_target": "merger"},
+                   {"type": "token_mlp", "hidden": 8, "latent_channels": 4})
+    assert student.output_mode == "raw"
+    assert not any(k.startswith("output_") for k in student.state_dict())  # old checkpoints still load strictly
+    mean = torch.arange(24.0)
+    student.init_output_bias(mean)
+    assert torch.equal(student.decoder.net[-1].bias, mean)
+
+
+def test_float_latent_mode_passes_latents_through():
+    student = make({"encoder_input": "merger", "decoder_target": "merger"},
+                   {"type": "token_mlp", "hidden": 8, "latent_channels": 4})
+    out = student(torch.randn(7, 24), GRID, quant_mode="none")
+    assert torch.equal(out["z_hat"], out["z"])

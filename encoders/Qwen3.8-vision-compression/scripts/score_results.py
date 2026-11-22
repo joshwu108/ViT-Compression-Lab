@@ -225,8 +225,10 @@ def main():
             "output_tokens": {c: median_of(records, c, "generation", "output_tokens")
                               for c in CONDITIONS},
         },
+        # INT codec check only; learned-codec (es_eval.py) records do not have it -> None.
         "cpu_gpu_quantization_identical": sum(
-            r["sizes"]["cpu_gpu_quantization_identical"] for r in records),
+            r["sizes"]["cpu_gpu_quantization_identical"] for r in records)
+        if "cpu_gpu_quantization_identical" in records[0]["sizes"] else None,
     }
     (args.run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({k: v for k, v in summary.items() if k != "run_info"}, indent=2))

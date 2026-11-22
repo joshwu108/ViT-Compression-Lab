@@ -10,10 +10,23 @@ no teacher model is loaded at all (``--cache-only``).
 
 Writes runs/<name>/{config.json, run_info.json, metrics.jsonl, checkpoints/}.
 Resume with --resume (loads checkpoints/latest.pt). Nothing is downloaded.
+
+Step mode (training.max_steps set, e.g. --set training.max_steps=1000
+--set training.eval_every_steps=50) trains to a total number of optimizer
+updates. Every eval_every_steps it evaluates a fixed training subset and the
+validation set with the eval quantization (rounding) and pooled dataset-level
+metrics, then writes latest.pt / best.pt; no per-epoch checkpoints are kept.
+--init-checkpoint continues another run's checkpoint in a new run directory.
+
+Resume restores model, entropy tables, both optimizers, scheduler, epoch, step
+and the position inside the epoch. Checkpoints written by this version also
+carry the torch RNG state; older ones do not, so continuing them gives a valid
+but not bit-identical continuation of the original noise stream.
 """
 
 import argparse
 import hashlib
+import json
 import math
 import sys
 import time
@@ -30,10 +43,12 @@ from vit_compression_lab.entropic.checkpoint import (  # noqa: E402
     RunDir,
     hardware_info,
     load_checkpoint,
+    load_student_state,
     save_checkpoint,
     software_info,
 )
 from vit_compression_lab.entropic.config import MERGER, StudentConfig, VisionDims  # noqa: E402
+from vit_compression_lab.entropic.diagnostics import FeatureErrorStats  # noqa: E402
 from vit_compression_lab.entropic.grid import counts_for_level, token_counts  # noqa: E402
 from vit_compression_lab.entropic.losses import distortion_loss, stage1_loss  # noqa: E402
 from vit_compression_lab.entropic.metrics import reconstruction_metrics  # noqa: E402
@@ -47,6 +62,7 @@ from vit_compression_lab.entropic.qwen.data import (  # noqa: E402
     read_manifest,
 )
 from vit_compression_lab.entropic.qwen.vision_tower import TeacherSplit, load_vision_tower  # noqa: E402
+from vit_compression_lab.run_checkpoint import sha256_file  # noqa: E402
 
 
 def needed_points(config):
@@ -105,7 +121,8 @@ def run_batch(student, split, batch, config, points, channel_stats, device, trai
     geo = split.geometry(grid) if (split is not None and config["deep_supervision"]) else None
 
     # run student with input, grid
-    out = student(u, grid, quant_mode=None if train else "round")
+    # quantization comes from config["quantization"]: "train" mode here, "eval" under student.eval()
+    out = student(u, grid)
     out["deep"] = {}
     for term in config["deep_supervision"]:
         out["deep"][term["point"]] = propagate(split, out["recon"], grid, sp.target_depth(split.dims),
@@ -158,6 +175,104 @@ def evaluate(student, split, loader, config, points, channel_stats, device, code
     return summary
 
 
+@torch.no_grad()
+def evaluate_dataset(student, split, loader, config, points, channel_stats, mean, device, coded_examples,
+                     channel=None):
+    """Step-mode evaluation. ``loader`` yields ONE image per batch.
+    Measures how good the student performs on a whole set of images in setp mode
+
+        student - EntropicStudent being trained
+        split - where the frozne teacher's vision tower is
+        loader - DataLoader that yields one image per batch in fixed order
+        config - StudentConfig with settings
+        points - names of where the teacher feature locations are needed (encoder input, decoder target, etc)
+        channel_stats - dictionary from point to per channel std
+        mean - per-channel training mean at decoder target
+        device - GPU or CPU
+        coded_examples - how many images to entropy code
+        channel - channel index whose error is reported separately
+    """
+    student.eval() # eval quantization rounding
+    student.entropy.update(force=True) # rebuild integer CDF tables the entropy encoder uses
+
+    sp = config.split
+    codable = config["quantization"]["eval"] != "none"
+    stats = None # error accumulator
+    logs, coded, bits, tokens = [], [], 0.0, 0
+
+    # iterate over images
+    for batch in loader:
+        # run student on this image
+        _, log, out, acts, grid = run_batch(student, split, batch, config, points, channel_stats, device, False)
+        target = acts[sp.decoder_target].float()
+
+        if stats is None:
+            # create error accumulator object, defined in daignostics.py
+            c = target.shape[1]
+            std = channel_stats[sp.decoder_target] if channel_stats else torch.ones(c, device=device)
+            stats = FeatureErrorStats(mean if mean is not None else torch.zeros(c, device=device), std)
+
+        # add errors to running sums
+        stats.add(target, out["recon"])
+        logs.append({k: float(v) for k, v in log.items()})
+        n = sum(token_counts(grid))
+        bits += float(log["bits"])
+        tokens += n
+        if codable and len(coded) < coded_examples:
+            # Real entropy coding: bytes, exact latent round trip, and decoded features == forward().
+            u = acts[sp.encoder_input].float()
+            strings, counts, _ = student.compress(u, grid)
+            blob = payload_lib.pack(payload_lib.make_header(sp, grid.cpu(), counts, student.latent_channels), strings)
+            z_dec = torch.cat([student.entropy.decompress(s, k, device=device) for s, k in zip(strings, counts)])
+            recon_dec = student.decompress(strings, grid, device=device)
+            coded.append({"bytes": len(blob), "tokens": n,
+                          "latent_exact": torch.equal(out["z_hat"].to(z_dec.dtype), z_dec),
+                          "recon_max_abs_diff": (recon_dec - out["recon"]).abs().max().item()})
+    summary = {
+        "aggregation": "loss/distortion/rate_nats: mean over images; all other metrics pooled over tokens",
+        "images": len(logs),
+        "loss": sum(e["loss"] for e in logs) / len(logs),
+        "distortion": sum(e["distortion"] for e in logs) / len(logs),
+        "rate_nats": sum(e["rate"] for e in logs) / len(logs),
+        "estimated_bits_per_visual_token": bits / tokens if codable else None,
+        **stats.result(channel),
+    }
+    if coded:
+        summary["coded"] = {
+            "images": len(coded),
+            "bits_per_visual_token": 8 * sum(c["bytes"] for c in coded) / sum(c["tokens"] for c in coded),
+            "roundtrip_exact": all(c["latent_exact"] for c in coded),
+            "recon_max_abs_diff": max(c["recon_max_abs_diff"] for c in coded),
+        }
+    student.train() # back to training behavior
+    return summary
+
+
+def apply_overrides(raw, assignments):
+    """--set a.b=value: replace an existing config entry; the value is parsed as JSON."""
+    for item in assignments:
+        key, _, value = item.partition("=")
+        *parents, leaf = key.split(".")
+        node = raw
+        for part in parents:
+            node = node[part]
+        if leaf not in node:
+            raise KeyError(f"--set {key}: no such config entry")
+        node[leaf] = json.loads(value)
+
+
+def grad_norm(parameters):
+    grads = [p.grad for p in parameters if p.grad is not None]
+    return torch.sqrt(sum(g.pow(2).sum() for g in grads)) if grads else torch.tensor(0.0)
+
+
+def rng_state(device):
+    state = {"torch": torch.get_rng_state()}
+    if device.type == "cuda":
+        state["cuda"] = torch.cuda.get_rng_state(device)
+    return state
+
+
 def main():
 
     # argument parsing
@@ -173,15 +288,33 @@ def main():
                         help="Never load the teacher; all needed points must be cached")
     parser.add_argument("--coded-examples", type=int, default=4,
                         help="Images actually entropy coded at each evaluation")
+    parser.add_argument("--run-name", help="Run directory name (default: the config's name)")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                        help="Override a config entry, e.g. --set rate.beta=0 (repeatable; JSON value)")
+    parser.add_argument("--init-checkpoint", type=Path,
+                        help="Start a NEW run from another run's checkpoint: model, entropy tables, "
+                             "optimizers, scheduler, epoch and step are all restored")
+    parser.add_argument("--diagnostic-channel", type=int, default=3994,
+                        help="Channel whose error is reported separately in step-mode evaluation")
     args = parser.parse_args()
 
     device = torch.device(args.device)
     config = StudentConfig.load(args.config)
+    apply_overrides(config.raw, args.set)
+    if args.run_name:
+        config.raw["name"] = args.run_name
+    config = StudentConfig.from_dict(config.raw)  # re-validate after overrides
     training_config = config["training"]
     if args.epochs is not None:
         training_config["epochs"] = args.epochs
     if args.limit is not None:
         config.raw["data"]["train_limit"] = args.limit
+    max_steps, eval_every = training_config["max_steps"], training_config["eval_every_steps"]
+    step_mode = max_steps is not None
+    if step_mode and not eval_every:
+        parser.error("training.max_steps needs training.eval_every_steps")
+    if args.resume and args.init_checkpoint:
+        parser.error("--init-checkpoint starts a new run; use --resume alone to continue this one")
     torch.manual_seed(training_config["seed"])
 
     teacher = config["teacher"] # extract the teacher mdoel
@@ -219,7 +352,7 @@ def main():
         counts = [estimate_patch_count(r, processor) for r in rows] # defines the patches needed per image
 
         # determines which indices belong in each batch
-        sampler = PatchBudgetBatchSampler(counts, training_config["max_patches_per_batch"], shuffle=shuffle, seed=tr["seed"])
+        sampler = PatchBudgetBatchSampler(counts, training_config["max_patches_per_batch"], shuffle=shuffle, seed=training_config["seed"])
         if sampler.dropped:
             print(f"{sampler.dropped} examples exceed max_patches_per_batch and are skipped")
 
@@ -231,14 +364,28 @@ def main():
     train_loader, train_sampler = make_loader(train_rows, shuffle=True)
     val_loader = make_loader(val_rows, shuffle=False)[0] if val_rows else None
 
-    channel_stats = None
+    def make_eval_loader(rows):
+        # step mode: one image per batch, fixed order, so dataset-level metrics need no batch weighting
+        dataset = ImageManifestDataset(rows, processor, cache, cache_points)
+        return DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_packed)
+
+    channel_stats, channel_mean = None, None
     if data["channel_stats"]:
-        # load previously saved feature statistics
+        # load previously saved feature statistics (computed on the training manifest only)
         stats = torch.load(data["channel_stats"], weights_only=False)
         channel_stats = {p: v["std"].to(device) for p, v in stats.items()}
+        channel_mean = {p: v["mean"].to(device) for p, v in stats.items()}
+    target_mean = (channel_mean or {}).get(config.split.decoder_target)
 
     # create the student model described in config
     student = EntropicStudent(config, dims).to(device)
+    needs_stats = student.output_mode == "normalized" or config["decoder"]["bias_init"] == "train_mean"
+    if needs_stats and target_mean is None:
+        parser.error("decoder.output 'normalized' / bias_init 'train_mean' need data.channel_stats")
+    if student.output_mode == "normalized":
+        student.set_output_stats(target_mean, channel_stats[config.split.decoder_target])
+    if config["decoder"]["bias_init"] == "train_mean":
+        student.init_output_bias(target_mean)
 
     # optimizer for encoder, decoder, entropy distribution (objective = reconstruction error + rate penalty)
     main_opt = torch.optim.Adam(student.main_parameters(), lr=training_config["lr"], weight_decay=training_config["weight_decay"])
@@ -248,20 +395,45 @@ def main():
     scheduler = torch.optim.lr_scheduler.MultiStepLR(main_opt, milestones=training_config["milestones"], gamma=training_config["gamma"])
 
     run = RunDir(args.runs_dir, config.name, resume=args.resume)
-    start_epoch, step, best = 0, 0, math.inf
-    if args.resume and run.checkpoint_path("latest").exists():
-        # restore existing run
-        ckpt = load_checkpoint(run.checkpoint_path("latest"), map_location=device)
-        student.load_state_dict(ckpt["state_dict"])
+    start_epoch, step, best, skip_batches = 0, 0, math.inf, 0
+    resuming = args.resume and run.checkpoint_path("latest").exists()
+    source = run.checkpoint_path("latest") if resuming else args.init_checkpoint
+    restored = None
+    if source is not None:
+        # restore a full training state into the student the optimizers were built on
+        ckpt = load_checkpoint(source, map_location=device)
+        if "optimizers" not in ckpt:
+            parser.error(f"{source} has no optimizer state (use a latest.pt)")
+        load_student_state(student, ckpt["state_dict"])
         main_opt.load_state_dict(ckpt["optimizers"]["main"])
         aux_opt.load_state_dict(ckpt["optimizers"]["aux"])
         scheduler.load_state_dict(ckpt["optimizers"]["scheduler"])
-        start_epoch, step = ckpt["epoch"] + 1, ckpt["step"]
-        best = ckpt.get("extra", {}).get("best", math.inf)
-        print(f"resumed at epoch {start_epoch}, step {step}")
+        extra = ckpt.get("extra", {})
+        step, best = ckpt["step"], extra.get("best", math.inf)
+        if "batches_done_in_epoch" in extra:
+            # saved inside epoch ckpt["epoch"]: redo that epoch's (deterministic) order, skipping what ran
+            start_epoch, skip_batches = ckpt["epoch"], extra["batches_done_in_epoch"]
+        else:
+            start_epoch = ckpt["epoch"] + 1  # epoch-boundary checkpoint
+        if "rng" in extra:
+            torch.set_rng_state(extra["rng"]["torch"].cpu())
+            if "cuda" in extra["rng"] and device.type == "cuda":
+                torch.cuda.set_rng_state(extra["rng"]["cuda"].cpu(), device)
+        adam_steps = {name: int(next(iter(opt.state_dict()["state"].values()))["step"])
+                      for name, opt in (("main", main_opt), ("aux", aux_opt))}
+        restored = {"path": str(source), "sha256": sha256_file(source), "epoch": ckpt["epoch"], "step": step,
+                    "skip_batches": skip_batches, "rng_restored": "rng" in extra, "best": best,
+                    "adam_steps": adam_steps, "scheduler_last_epoch": scheduler.last_epoch,
+                    "cdf_table_shape": list(student.entropy._quantized_cdf.shape)}
+        print(f"restored {source}: epoch {start_epoch}, step {step}, skipping {skip_batches} batches, "
+              f"rng restored: {'rng' in extra}")
+    if resuming:
+        run.log({"phase": "resume", "step": step, "restored": restored, "training": training_config})
     else:
         run.write_config(config)
         run.write_run_info({
+            "command": sys.argv, "overrides": args.set, "seed": training_config["seed"],
+            "init_checkpoint": restored,
             "stage": 1, "config_sha256": hashlib.sha256(args.config.read_bytes()).hexdigest(),
             "teacher": teacher, "teacher_loaded": split is not None, "points": sorted(points),
             "cache_points": cache_points, "split": config.split.as_dict(), "option": config.split.option,
@@ -269,18 +441,71 @@ def main():
             "val_examples": len(val_rows), "software": software_info(), "hardware": hardware_info(device),
         })
 
+    train_eval_loader = make_eval_loader(train_rows[: data["train_eval_limit"]]) if step_mode else None
+    val_eval_loader = make_eval_loader(val_rows) if (step_mode and val_rows) else None
+
+    def save_latest(epoch, batches_done=None):
+        extra = {"best": best, "rng": rng_state(device)}
+        if batches_done is not None:
+            extra["batches_done_in_epoch"] = batches_done
+        optimizers = {"main": main_opt, "aux": aux_opt, "scheduler": scheduler}
+        save_checkpoint(run.checkpoint_path("latest"), student, epoch, step, optimizers, extra=extra)
+
+    def step_evaluation(epoch, batches_done, save=True):
+        """Rounded evaluation of the fixed training subset and validation set, then checkpoints."""
+        nonlocal best
+        record = {"phase": "eval", "epoch": epoch, "step": step, "quantization": config["quantization"]["eval"]}
+        for name, loader in (("train", train_eval_loader), ("val", val_eval_loader)):
+            if loader is not None:
+                record[name] = evaluate_dataset(student, split, loader, config, points, channel_stats, target_mean,
+                                                device, args.coded_examples, args.diagnostic_channel)
+        run.log(record)
+        coded = [record[k]["coded"] for k in ("train", "val") if "coded" in record.get(k, {})]
+        if any(not c["roundtrip_exact"] for c in coded):
+            run.log({"phase": "abort", "step": step, "reason": "entropy round trip failed"})
+            raise SystemExit("entropy round trip failed; run stopped (latest.pt is the last good state)")
+        print(f"eval step {step}: " + " | ".join(
+            f"{k} loss {record[k]['loss']:.0f} std-mse {record[k]['standardized_mse']:.4f} "
+            f"relL2 {record[k]['relative_l2']:.4f}" for k in ("train", "val") if k in record))
+        if not save:
+            return
+        score = record.get("val", record["train"])["loss"]
+        if score < best:
+            best = score
+            save_checkpoint(run.checkpoint_path("best"), student, epoch, step, extra={"best": best})
+        save_latest(epoch, batches_done)
+        milestone = training_config["milestone_every_steps"]
+        if milestone and step % milestone == 0:
+            save_checkpoint(run.checkpoint_path(f"step-{step:06d}"), student, epoch, step, extra={"best": best})
+
     student.train() #enable training behavior
-    for epoch in range(start_epoch, training_config["epochs"]):
+    if step_mode and not resuming:
+        step_evaluation(start_epoch, skip_batches, save=False)  # starting point (initialisation or source run)
+    epoch = start_epoch
+    while (step < max_steps) if step_mode else (epoch < training_config["epochs"]):
         train_sampler.set_epoch(epoch)
         epoch_start = time.time() #record start time
-        for batch in train_loader:
+        stop = False
+        for batch_index, batch in enumerate(train_loader):
+            if batch_index < skip_batches:
+                continue  # already trained on before the checkpoint we restored
             # run student and compute main objective
             loss, log, _, _, _ = run_batch(student, split, batch, config, points, channel_stats, device, True)
             aux = student.entropy.aux_loss()
             main_opt.zero_grad(set_to_none=True) #clear previous gradients
             loss.backward() # compute gradients of loss with respect tio the main parameters
+            log_now = (step + 1) % training_config["log_every"] == 0
+            if log_now:  # per-module gradient norms, before clipping
+                grads = {f"grad_norm/{name}": grad_norm(module.parameters()).item() for name, module in
+                         (("encoder", student.encoder), ("decoder", student.decoder), ("entropy", student.entropy))}
             if training_config["grad_clip"]:
-                torch.nn.utils.clip_grad_norm_(student.main_parameters(), training_config["grad_clip"])
+                total_grad = torch.nn.utils.clip_grad_norm_(student.main_parameters(), training_config["grad_clip"])
+            else:
+                total_grad = grad_norm(student.main_parameters())
+            if not (torch.isfinite(loss) and torch.isfinite(total_grad)):
+                run.log({"phase": "abort", "epoch": epoch, "step": step, "reason": "non-finite loss or gradient",
+                         "loss": loss.item(), "grad_norm": total_grad.item()})
+                raise SystemExit(f"non-finite loss or gradient at step {step}; no update applied, run stopped")
             main_opt.step()
 
             # auxiliary parameters update
@@ -289,12 +514,25 @@ def main():
             aux_opt.step()
 
             step += 1
-            if step % training_config["log_every"] == 0:
+            if log_now:
                 run.log({"phase": "train", "epoch": epoch, "step": step, "lr": scheduler.get_last_lr()[0],
-                         "aux_loss": aux.item(), **{k: float(v) for k, v in log.items()}})
+                         "aux_loss": aux.item(), "grad_norm": total_grad.item(), **grads,
+                         **{k: float(v) for k, v in log.items()}})
                 print(f"epoch {epoch} step {step} loss {log['loss']:.4f} mse {log['mse']:.5f} "
                       f"bits/tok {log['bits_per_visual_token']:.1f}")
+            if step_mode:
+                if step % eval_every == 0 or step >= max_steps:
+                    step_evaluation(epoch, batch_index + 1)
+                if step >= max_steps:
+                    stop = True
+                    break
+        skip_batches = 0
+        if stop:
+            break  # scheduler.step() for this epoch happens on resume, after the skipped batches
         scheduler.step()
+        if step_mode:
+            epoch += 1
+            continue
         record = {"phase": "epoch", "epoch": epoch, "step": step, "seconds": time.time() - epoch_start}
 
         # run evaluation
@@ -307,10 +545,10 @@ def main():
                 save_checkpoint(run.checkpoint_path("best"), student, epoch, step, extra={"best": best, "val": val})
         run.log(record)
         student.entropy.update(force=True)
-        optimizers = {"main": main_opt, "aux": aux_opt, "scheduler": scheduler}
-        save_checkpoint(run.checkpoint_path("latest"), student, epoch, step, optimizers, extra={"best": best})
+        save_latest(epoch)
         save_checkpoint(run.checkpoint_path(f"epoch-{epoch:03d}"), student, epoch, step, extra={"best": best})
         print(f"epoch {epoch} done: {record.get('val', {})}")
+        epoch += 1
 
 
 if __name__ == "__main__":

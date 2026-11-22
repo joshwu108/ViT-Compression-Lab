@@ -307,7 +307,7 @@ def build_decoder(cfg, encoder, latent, d_out, out_level):
     kind = encoder.family if cfg.get("type", "mirror") == "mirror" else cfg["type"]
     if kind not in DECODERS:
         raise ValueError(f"Unknown decoder type {kind!r}; choose from {sorted(DECODERS)}")
-    kwargs = {k: v for k, v in cfg.items() if k != "type"}
+    kwargs = {k: v for k, v in cfg.items() if k not in ("type", "output", "bias_init")}
     if kind == "grid_conv":
         kwargs.setdefault("num_down", getattr(encoder, "num_down", 1))
         kwargs["encoder"] = encoder
@@ -359,6 +359,15 @@ class EntropicStudent(nn.Module):
         self.latent_channels = latent
         self.d_in, self.d_out = d_in, d_out
 
+        self.output_mode = config["decoder"].get("output", "raw")
+        if self.output_mode == "normalized":
+            # h_hat = mean + std * decoder(z_hat). Buffers, so they are saved in checkpoints;
+            # fill them once with set_output_stats() before training.
+            self.register_buffer("output_mean", torch.zeros(d_out))
+            self.register_buffer("output_std", torch.ones(d_out))
+        elif self.output_mode != "raw":
+            raise ValueError(f"Unknown decoder output {self.output_mode!r}; choose 'raw' or 'normalized'")
+
     # --------------------------------------------------------- pieces
 
     def encode(self, u, grid_thw):
@@ -369,7 +378,27 @@ class EntropicStudent(nn.Module):
         return self.encoder(u, grid_thw)
 
     def decode(self, z_hat, grid_thw):
-        return self.decoder(z_hat, grid_thw)
+        """Always returns features in the teacher's scale (forward and decompress go through here)."""
+        y = self.decoder(z_hat, grid_thw)
+        if self.output_mode == "normalized":
+            y = self.output_mean + self.output_std * y
+        return y
+
+    @torch.no_grad()
+    def set_output_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Training-set channel statistics for decoder.output == 'normalized'."""
+        if self.output_mode != "normalized":
+            raise ValueError("set_output_stats needs decoder.output == 'normalized'")
+        self.output_mean.copy_(mean.to(device=self.output_mean.device, dtype=self.output_mean.dtype))
+        self.output_std.copy_(std.to(device=self.output_std.device, dtype=self.output_std.dtype).clamp_min(1e-6))
+
+    @torch.no_grad()
+    def init_output_bias(self, mean: torch.Tensor) -> None:
+        """Ablation (decoder.bias_init == 'train_mean'): start the last decoder bias at the mean."""
+        last = getattr(self.decoder, "net", [None])[-1]
+        if not isinstance(last, nn.Linear) or last.bias.shape != mean.shape:
+            raise ValueError("bias_init 'train_mean' needs a decoder ending in Linear(d_out)")
+        last.bias.copy_(mean.to(last.bias))
 
     def latent_counts(self, grid_thw):
         return self.encoder.latent_counts(grid_thw)

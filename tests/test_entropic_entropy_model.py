@@ -12,8 +12,14 @@ def test_likelihood_is_a_probability_and_sums_to_about_one():
     z = grid[:, None].repeat(1, 3)
     _, likelihood = model(z, mode="round")  # integers around the (zero) medians
     assert likelihood.min() > 0 and likelihood.max() <= 1
+    # The bins tile [-60.5, 60.5], so their sum plus the mass outside that interval is exactly 1.
+    # (At initialisation the density is wide: about 0.5% of the mass lies beyond +-60.)
+    edges = torch.tensor([-60.5, 60.5]).repeat(3, 1, 1)  # [C, 1, 2]
+    cdf = torch.sigmoid(model._logits_cumulative(edges, stop_gradient=True))[:, 0, :]
+    tails = cdf[:, 0] + (1 - cdf[:, 1])
     totals = likelihood.sum(0)
-    assert torch.allclose(totals, torch.ones(3), atol=1e-3)
+    assert torch.allclose(totals + tails, torch.ones(3), atol=1e-5)
+    assert torch.all(tails < 0.01)
 
 
 def test_noise_mode_perturbs_within_half_a_unit():

@@ -138,9 +138,13 @@ DEFAULTS = {
     "stem": {"type": "none"},  # only for encoder_input == "pixels": {"type": "linear", "dim": 384}
     "body": {"type": "none"},  # optional student body: {"type": "attention", "depth": 2, "heads": 6}
     "encoder": {"type": "token_mlp", "hidden": 1024, "latent_channels": 256, "gdn": True},
-    "decoder": {"type": "mirror", "hidden": 1024, "gdn": True},
+    # decoder.output: "raw" (decoder emits teacher-scale features) | "normalized"
+    #   (h_hat = train_mean + train_std * decoder(z_hat); stats stored as checkpoint buffers).
+    # decoder.bias_init: "default" | "train_mean" (final bias starts at the training-set mean).
+    "decoder": {"type": "mirror", "hidden": 1024, "gdn": True, "output": "raw", "bias_init": "default"},
     "entropy": {"type": "factorized", "filters": [3, 3, 3], "init_scale": 10.0, "tail_mass": 1e-9},
-    "quantization": {"train": "noise", "eval": "round"},  # train: noise | ste
+    # train: noise | ste. "none" (both) is a float-latent diagnostic: no quantization, not codable.
+    "quantization": {"train": "noise", "eval": "round"},
     "distortion": {"type": "mse", "reduction": "sum_per_image", "cosine_weight": 0.0},
     "deep_supervision": [],  # e.g. [{"point": "merger", "weight": 1.0, "type": "standardized_mse"}]
     "rate": {"beta": 0.08, "reduction": "sum_per_image"},
@@ -149,9 +153,14 @@ DEFAULTS = {
         "milestones": [5, 8], "gamma": 0.1, "grad_clip": 1.0,
         "max_patches_per_batch": 16384, "seed": 0, "log_every": 20,
         "eval_every_epoch": True, "num_workers": 4,
+        # Step mode (max_steps set): train until this many optimizer updates in total, evaluate
+        # and save latest/best every eval_every_steps, keep a step-XXXXXX.pt every
+        # milestone_every_steps. Epoch-end evaluation and epoch-XXX.pt files are skipped.
+        "max_steps": None, "eval_every_steps": None, "milestone_every_steps": None,
     },
     "data": {
         "train_manifests": [], "val_manifests": [], "train_limit": None, "val_limit": 64,
+        "train_eval_limit": 64,  # step mode: first N training images, evaluated like validation
         "feature_cache": None, "channel_stats": None,
     },
     "teacher": {
