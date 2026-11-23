@@ -7,15 +7,16 @@
   "deep_supervision": [],
   "rate": {"beta": 0.08, "reduction": "sum_per_image"},
   "training": {
-    "max_steps": 5000, "eval_every_steps": 500, "milestone_every_steps": null,
+    "max_steps": 5000, "eval_every_steps": 500, "full_eval_every_steps": 1000, "milestone_every_steps": null,
     "lr": 0.001, "milestones": [], "seed": 0,
     "max_patches_per_batch": 8192, "num_workers": 0, "log_every": 20
   },
   "data": {
     "train_manifests": ["data/es-abc-pilot5k/manifest.jsonl"],
     "val_manifests": ["data/es-abc-pilot5k/val_manifest.jsonl"],
+    "val_fast_manifests": ["data/es-abc-pilot5k/val_fast_manifest.jsonl"],
     "train_limit": null, "val_limit": 500, "train_eval_limit": 32,
-    "feature_cache": null,
+    "feature_cache": "outputs/qwen3.8/es-abc-pilot5k/cache",
     "channel_stats": "outputs/qwen3.8/es-abc-pilot5k/stats/channel_stats.pt"
   }
 }

@@ -17,7 +17,8 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from safetensors.torch import load_file, save_file
+from safetensors import safe_open
+from safetensors.torch import save_file
 from torch.utils.data import Dataset, Sampler
 from transformers import AutoProcessor
 
@@ -103,7 +104,12 @@ def estimate_patch_count(row, processor):
 
 
 class FeatureCache:
-    """One safetensors file per example: pixel_values, grid_thw and teacher activations."""
+    """One safetensors file per example: grid_thw, teacher activations, optionally pixel_values.
+
+    Files are written to a temporary name and renamed, so an interrupted
+    extraction never leaves a partial entry. Each file's metadata records what
+    it was computed from (see es_extract_teacher_features.py).
+    """
 
     def __init__(self, root):
         self.root = Path(root)
@@ -123,23 +129,39 @@ class FeatureCache:
         tmp.replace(self.path(example_id))
 
     def load(self, example_id, keys=None):
-        tensors = load_file(str(self.path(example_id)))
-        if keys is not None:
-            missing = [k for k in keys if k not in tensors]
+        """Read only the requested tensors (all of them when ``keys`` is None)."""
+        with safe_open(str(self.path(example_id)), framework="pt") as f:
+            missing = [k for k in (keys or []) if k not in f.keys()]
             if missing:
                 raise KeyError(f"{example_id}: cache lacks {missing}")
-            tensors = {k: tensors[k] for k in keys}
-        return tensors
+            return {k: f.get_tensor(k) for k in (keys if keys is not None else f.keys())}
+
+    def describe(self, example_id):
+        """(metadata dict, {tensor name: shape}) from the file header; no tensor data is read."""
+        with safe_open(str(self.path(example_id)), framework="pt") as f:
+            metadata = {k: json.loads(v) for k, v in (f.metadata() or {}).items()}
+            return metadata, {k: list(f.get_slice(k).get_shape()) for k in f.keys()}
+
+    def patch_count(self, example_id):
+        """Patches of a cached example from its stored grid (the geometry actually extracted)."""
+        t, h, w = self.load(example_id, ["grid_thw"])["grid_thw"][0].tolist()
+        return t * h * w
 
 
 class ImageManifestDataset(Dataset):
-    """Returns pixel_values + grid_thw, and cached teacher activations when a cache is given."""
+    """Returns grid_thw plus pixel_values and/or cached teacher activations.
 
-    def __init__(self, rows, processor, cache=None, cache_points=()):
+    With ``load_pixels=False`` and ``cache_points`` set, items come from the
+    feature cache alone (no pixel tensors, no image preprocessing, and
+    ``processor`` may be None): the cache-only path of Option C.
+    """
+
+    def __init__(self, rows, processor, cache=None, cache_points=(), load_pixels=True):
         self.rows = rows
         self.processor = processor
         self.cache = cache
         self.cache_points = list(cache_points)
+        self.load_pixels = load_pixels
 
     def __len__(self):
         return len(self.rows)
@@ -148,10 +170,11 @@ class ImageManifestDataset(Dataset):
         row = self.rows[index]
         item = {"id": row["id"]}
         if self.cache is not None and self.cache.has(row["id"]):
-            keys = ["pixel_values", "grid_thw"] + self.cache_points
+            keys = ["grid_thw"] + self.cache_points + (["pixel_values"] if self.load_pixels else [])
             tensors = self.cache.load(row["id"], keys)
-            item["pixel_values"] = tensors["pixel_values"]
             item["grid_thw"] = tensors["grid_thw"]
+            if self.load_pixels:
+                item["pixel_values"] = tensors["pixel_values"]
             item["features"] = {p: tensors[p] for p in self.cache_points}
         else:
             if self.cache_points:
@@ -162,19 +185,26 @@ class ImageManifestDataset(Dataset):
 
 
 def collate_packed(items):
+    """Packed batch; ``pixel_values`` is present only when every item carries it."""
     batch = {
         "ids": [it["id"] for it in items],
-        "pixel_values": torch.cat([it["pixel_values"] for it in items], dim=0),
         "grid_thw": torch.cat([it["grid_thw"] for it in items], dim=0),
         "features": {},
     }
+    if all("pixel_values" in it for it in items):
+        batch["pixel_values"] = torch.cat([it["pixel_values"] for it in items], dim=0)
     for point in items[0]["features"]:
         batch["features"][point] = torch.cat([it["features"][point] for it in items], dim=0)
     return batch
 
 
 class PatchBudgetBatchSampler(Sampler):
-    """Greedy packing of examples until the summed patch count reaches the budget."""
+    """Greedy packing of examples until the summed patch count reaches the budget.
+
+    An example larger than the whole budget is dropped when ``drop_oversize`` is
+    true (counted in ``dropped``); otherwise it forms a batch of its own, so
+    every example stays in the epoch (``oversize`` counts those).
+    """
 
     def __init__(self, patch_counts, max_patches, shuffle=True, seed=0, drop_oversize=True):
         self.patch_counts = list(patch_counts)
@@ -182,8 +212,10 @@ class PatchBudgetBatchSampler(Sampler):
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
+        self.start_batch = 0  # skip this many batches of the next epoch (resume inside an epoch)
         self.indices = [i for i, n in enumerate(self.patch_counts) if not (drop_oversize and n > self.max_patches)]
         self.dropped = len(self.patch_counts) - len(self.indices)
+        self.oversize = sum(1 for i in self.indices if self.patch_counts[i] > self.max_patches)
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -200,11 +232,16 @@ class PatchBudgetBatchSampler(Sampler):
                 batch, total = [], 0
             batch.append(i)
             total += n
+            if total > self.max_patches:  # a single oversize example: never packed with others
+                yield batch
+                batch, total = [], 0
         if batch:
             yield batch
 
     def __iter__(self):
-        return iter(list(self._batches()))
+        batches = list(self._batches())[self.start_batch:]
+        self.start_batch = 0
+        return iter(batches)
 
     def __len__(self):
         return sum(1 for _ in self._batches())

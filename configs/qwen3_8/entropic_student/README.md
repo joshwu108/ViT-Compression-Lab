@@ -30,94 +30,129 @@ Key fields:
 Paths are relative to the repository root. No data referenced here exists yet:
 the training image directory must be supplied and indexed first.
 
-## A/B/C pilot on broader data
+## Pilot on broader data (`pilot5k/`): Option C is the only active experiment
 
-`pilot5k/` contains three new Stage 1 configurations (not trained):
+`pilot5k/` holds three Stage 1 configurations. **Only C is being run.** The A and B
+files are kept unchanged for future work and have not been trained.
 
-| Config | Split | Student encoder |
-| --- | --- | --- |
-| `a_pixels_merger_beta0.08.json` | pixels -> merger: full vision replacement | learned patch stem + 2 attention blocks + window MLP |
-| `b_block8_windowmlp_beta0.08.json` | block 8 -> block 8, then frozen Qwen suffix | window MLP |
-| `c_merger_tokenmlp_beta0.08.json` | merger -> merger | token MLP |
+| Config | Split | Student encoder | Status |
+| --- | --- | --- | --- |
+| `c_merger_tokenmlp_beta0.08.json` | merger -> merger | token MLP | **active**: trains from the feature cache alone |
+| `a_pixels_merger_beta0.08.json` | pixels -> merger: full vision replacement | learned patch stem + 2 attention blocks + window MLP | not run |
+| `b_block8_windowmlp_beta0.08.json` | block 8 -> block 8, then frozen Qwen suffix | window MLP | not run |
 
-Suggested dataset: sample 2,750 unique images from COCO **train2014** and 2,750
-from the TextVQA **training annotation IDs**, then split the 5,500-image pool
-into 5,000 training and 500 held-out images. Stage 1 needs images, not questions
-or answers. Keep the existing pilot/eval-3000 manifests reserved for evaluation.
-The TextVQA image archive includes validation images too; select training IDs
-before indexing. Official sources: [COCO/VQA images](https://visualqa.org/download.html),
-[TextVQA](https://textvqa.org/dataset/).
+On this SSH host, the new pilot's storage lives under
+`/mnt/nfs/joshua/ViT-compression-lab/`. The following local directory links
+point to the corresponding paths on NFS:
 
-After obtaining that image-only pool under `data/es-abc-pilot5k/images`, run from
-the repository root (these commands require a working CUDA GPU):
+```text
+data/es-abc-pilot5k                -> /mnt/nfs/joshua/ViT-compression-lab/data/es-abc-pilot5k
+outputs/qwen3.8/es-abc-pilot5k      -> /mnt/nfs/joshua/ViT-compression-lab/outputs/qwen3.8/es-abc-pilot5k
+runs/qwen3.8/es-abc-pilot5k         -> /mnt/nfs/joshua/ViT-compression-lab/runs/qwen3.8/es-abc-pilot5k
+```
+
+Thus the relative paths in the configs and commands below already use NFS.
+These links are local setup in Git-ignored directories; another checkout needs
+equivalent storage setup. Existing experiments and the base-model cache retain
+their current locations. To inspect the destination, run
+`readlink -f data/es-abc-pilot5k`. A small create/write/sync/read/rename/delete
+check passed through all three links. Available filesystem capacity does not
+establish an individual quota; a `quota` tool is not installed on this host.
+
+### Data
+
+`scripts/prepare_es_train_pool.py` downloads only the selected images: 2,750 from
+COCO **train2014** and 2,750 from the TextVQA **training annotation IDs** (seed
+2026). Images whose source id, file SHA-256 or decoded-pixel SHA-256 appears in
+`data/eval-3000`, the two pilots or `data/es-stage1-smoke`, and duplicates, are
+rejected and replaced by the next candidate, so the counts stay exact. It splits
+by image, stratified by source:
+
+| File | Images |
+| --- | --- |
+| `manifest.jsonl` | 5,000 training (2,500 + 2,500) |
+| `val_manifest.jsonl` | 500 validation (250 + 250) |
+| `val_fast_manifest.jsonl` | fixed 64-image subset of validation (32 + 32) |
+| `train_monitor_manifest.jsonl` | the first 32 training rows (16 + 16), which `data.train_eval_limit=32` evaluates |
 
 ```sh
-.venv/bin/python scripts/prepare_image_manifest.py data/es-abc-pilot5k/images \
-  --output data/es-abc-pilot5k/manifest.jsonl --val-fraction 0.09090909090909091 --seed 2026
+.venv/bin/python scripts/prepare_es_train_pool.py --output-dir data/es-abc-pilot5k
+```
 
+### Feature cache and training-only statistics
+
+C needs only merger features and `grid_thw`, so the cache stores no pixels
+(`--no-pixels`). One command caches training and validation images and then
+computes the channel mean/std by streaming the completed cache over the ids of
+`--stats-manifests` only. Rerunning it resumes; cached entries are reused only if
+their stored image hash, model revision, dtype and preprocessing hash match.
+
+```sh
 .venv/bin/python encoders/Qwen3.8-vision-compression/scripts/es_extract_teacher_features.py \
-  data/es-abc-pilot5k/manifest.jsonl --points block_8 merger --stats-only \
-  --cache-dir outputs/qwen3.8/es-abc-pilot5k/stats --device cuda:1 --verify-depths 8
+  data/es-abc-pilot5k/manifest.jsonl data/es-abc-pilot5k/val_manifest.jsonl \
+  --points merger --no-pixels --device cuda:1 \
+  --cache-dir outputs/qwen3.8/es-abc-pilot5k/cache \
+  --stats-manifests data/es-abc-pilot5k/manifest.jsonl \
+  --stats-output outputs/qwen3.8/es-abc-pilot5k/stats/channel_stats.pt
 ```
 
-Confirm the manifests contain the expected 5,000/500 images after duplicate and
-evaluation-image exclusions. Statistics must be computed from training only.
-`--stats-only` writes channel statistics and extraction metadata, not cached
-activations. All three configs set `feature_cache=null`, so teacher features are
-recomputed during training. This trades GPU time for lower disk use.
+`stats/channel_stats.json` records the training manifest hash and the image and
+token counts behind the statistics.
 
-The configs share 256 latent channels, beta 0.08, normalized decoder output,
-an 8,192-patch batch budget, seed 0, and an initial 5,000-update budget.
-They evaluate 32 fixed training images and up to 500 held-out images every 500
-updates, and retain latest/best checkpoints without epoch or milestone copies.
-Learning-rate milestones are disabled for this first controlled pilot.
-Check for images skipped by the patch budget; all runs should use the same
-eligible image set. Normalized output is a conditioning choice, not a proven
-improvement to answer accuracy.
+### Training
 
-First measure a 100-update calibration run per config. For example, for B:
+The C config uses 256 latent channels, beta 0.08, normalized decoder output, an
+8,192-patch batch budget, learning rate 0.001, seed 0, no learning-rate
+milestones, and 5,000 optimizer updates. Two fields set the validation cadence:
 
-```sh
-.venv/bin/python encoders/Qwen3.8-vision-compression/scripts/es_train_stage1.py \
-  --config configs/qwen3_8/entropic_student/pilot5k/b_block8_windowmlp_beta0.08.json \
-  --runs-dir runs/qwen3.8/es-abc-pilot5k --run-name calibration_b --device cuda:1 \
-  --diagnostic-channel 0 --coded-examples 1 \
-  --set training.max_steps=100 --set training.eval_every_steps=100 \
-  --set data.train_eval_limit=8 --set data.val_limit=32
-```
+- `training.eval_every_steps=500`: the 32 training-monitor images and the 64
+  images of `data.val_fast_manifests`; writes `latest.pt`.
+- `training.full_eval_every_steps=1000` (and the last update): the full 500
+  validation images too. Only these evaluations can replace `best.pt`, which is
+  the checkpoint with the lowest full-validation loss with rounded latents.
 
-B reconstructs 1,152-channel block features: **pass `--diagnostic-channel 0`**;
-the default channel 3994 is valid for A/C merger targets, but invalid for B.
-Use distinct calibration run names for A/C. After inspecting timing and finite
-losses, start fresh pilot runs using the commands below (no `--cache-only`):
+With `--cache-only` the trainer loads neither the Qwen vision tower nor the image
+processor; batch sizes come from the cached grids. An image above the whole patch
+budget forms a batch of its own instead of being dropped.
 
 ```sh
-.venv/bin/python encoders/Qwen3.8-vision-compression/scripts/es_train_stage1.py \
-  --config configs/qwen3_8/entropic_student/pilot5k/a_pixels_merger_beta0.08.json \
-  --runs-dir runs/qwen3.8/es-abc-pilot5k --device cuda:1 --coded-examples 4
-
-.venv/bin/python encoders/Qwen3.8-vision-compression/scripts/es_train_stage1.py \
-  --config configs/qwen3_8/entropic_student/pilot5k/b_block8_windowmlp_beta0.08.json \
-  --runs-dir runs/qwen3.8/es-abc-pilot5k --device cuda:1 --coded-examples 4 --diagnostic-channel 0
-
+# 100-update calibration in its own run directory
 .venv/bin/python encoders/Qwen3.8-vision-compression/scripts/es_train_stage1.py \
   --config configs/qwen3_8/entropic_student/pilot5k/c_merger_tokenmlp_beta0.08.json \
-  --runs-dir runs/qwen3.8/es-abc-pilot5k --device cuda:1 --coded-examples 4
+  --runs-dir runs/qwen3.8/es-abc-pilot5k --run-name c_calibration100_s0 --device cuda:1 \
+  --cache-only --coded-examples 4 \
+  --set training.max_steps=100 --set training.eval_every_steps=50 --set training.full_eval_every_steps=100
+
+# the pilot run (add --resume to continue it from checkpoints/latest.pt)
+.venv/bin/python encoders/Qwen3.8-vision-compression/scripts/es_train_stage1.py \
+  --config configs/qwen3_8/entropic_student/pilot5k/c_merger_tokenmlp_beta0.08.json \
+  --runs-dir runs/qwen3.8/es-abc-pilot5k --device cuda:1 --cache-only --coded-examples 4
+
+tail -f runs/qwen3.8/es-abc-pilot5k/abc5k_c_merger_tokenmlp_beta0.08_s0/metrics.jsonl
 ```
 
-5,000 updates are a pilot budget, not a convergence guarantee, particularly for
-full-replacement A. At 0.5/1/2 seconds per update, optimization alone takes
-42/83/167 minutes per run; add extraction, evaluation, and checkpoint time.
-Measure each architecture separately: B differentiates through the frozen
-remaining vision blocks for its merger loss. All GPU timings are unmeasured
-for these configs. Previous C timings used cached features and do not transfer
-directly to these uncached runs.
+5,000 updates are a pilot budget, not a convergence guarantee, and not 5,000
+images: `metrics.jsonl` records `images_seen` and `tokens_seen`.
 
-Compare merger reconstruction, actual bits/visual token, client compute, and
-downstream answers on identical evaluation examples. Equal beta/latent width
-does not guarantee equal bitrate. Total training losses are not comparable
-across these setups because B has an extra reconstruction term.
-`es_eval_features.py` and `es_eval.py` support the configured splits. The old
-`es_recon_diagnostics.py` supports merger->merger students only; the existing
-study plots assume channel 3994 and need adaptation for B. Summarize B separately
-with `es_recon_study_summary.py --channel 0`.
+### Evaluation
+
+```sh
+# full-validation reconstruction and actual coded size, from the cache (no Qwen model)
+.venv/bin/python encoders/Qwen3.8-vision-compression/scripts/es_eval_cached.py \
+  data/es-abc-pilot5k/val_manifest.jsonl \
+  --student-checkpoint runs/qwen3.8/es-abc-pilot5k/abc5k_c_merger_tokenmlp_beta0.08_s0/checkpoints/best.pt \
+  --output outputs/qwen3.8/es-abc-pilot5k/evaluation/val500_best.json
+```
+
+Downstream answers on the fixed 70-question pilot use `es_eval.py`, then
+`score_results.py` and `report_retention.py`, exactly as for the INT8 / INT4-g64
+runs. Results are in `outputs/qwen3.8/es-abc-pilot5k/REPORT.md`.
+
+### Notes for A and B (not run)
+
+A and B have `feature_cache=null` and recompute teacher features during
+training (no `--cache-only`); B reconstructs 1,152-channel block features, so pass
+`--diagnostic-channel 0` (the default channel 3994 is valid only for merger
+targets). Total training losses are not comparable across the setups because B
+has an extra reconstruction term, and equal beta/latent width does not guarantee
+equal bitrate. All A/B timings are unmeasured.

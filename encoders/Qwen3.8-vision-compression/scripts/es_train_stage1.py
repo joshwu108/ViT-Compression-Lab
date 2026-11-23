@@ -16,6 +16,11 @@ Step mode (training.max_steps set, e.g. --set training.max_steps=1000
 updates. Every eval_every_steps it evaluates a fixed training subset and the
 validation set with the eval quantization (rounding) and pooled dataset-level
 metrics, then writes latest.pt / best.pt; no per-epoch checkpoints are kept.
+With training.full_eval_every_steps set there are two cadences: every
+eval_every_steps the training subset and data.val_fast_manifests ("val_fast")
+are evaluated and latest.pt is written; every full_eval_every_steps (and at
+max_steps) the full validation set ("val") is evaluated as well, and only
+those evaluations can replace best.pt (lowest full-validation loss).
 --init-checkpoint continues another run's checkpoint in a new run directory.
 
 Resume restores model, entropy tables, both optimizers, scheduler, epoch, step
@@ -177,7 +182,7 @@ def evaluate(student, split, loader, config, points, channel_stats, device, code
 
 @torch.no_grad()
 def evaluate_dataset(student, split, loader, config, points, channel_stats, mean, device, coded_examples,
-                     channel=None):
+                     channel=None, started=None):
     """Step-mode evaluation. ``loader`` yields ONE image per batch.
     Measures how good the student performs on a whole set of images in setp mode
 
@@ -192,6 +197,7 @@ def evaluate_dataset(student, split, loader, config, points, channel_stats, mean
         coded_examples - how many images to entropy code
         channel - channel index whose error is reported separately
     """
+    started = started or time.time()
     student.eval() # eval quantization rounding
     student.entropy.update(force=True) # rebuild integer CDF tables the entropy encoder uses
 
@@ -244,6 +250,7 @@ def evaluate_dataset(student, split, loader, config, points, channel_stats, mean
             "roundtrip_exact": all(c["latent_exact"] for c in coded),
             "recon_max_abs_diff": max(c["recon_max_abs_diff"] for c in coded),
         }
+    summary["seconds"] = time.time() - started
     student.train() # back to training behavior
     return summary
 
@@ -317,8 +324,13 @@ def main():
         parser.error("--init-checkpoint starts a new run; use --resume alone to continue this one")
     torch.manual_seed(training_config["seed"])
 
+    full_eval_every = training_config["full_eval_every_steps"]
+    if full_eval_every and (not step_mode or full_eval_every % eval_every):
+        parser.error("training.full_eval_every_steps needs step mode and a multiple of eval_every_steps")
+
     teacher = config["teacher"] # extract the teacher mdoel
-    processor = load_processor(teacher["checkpoint"], teacher["revision"]) # processor associated with that checkpoint
+    # --cache-only reads features and grids from the cache: no image preprocessing, no processor
+    processor = None if args.cache_only else load_processor(teacher["checkpoint"], teacher["revision"])
     points = needed_points(config) # teacher feature locations needed
     split = None
     dims = VisionDims()
@@ -337,37 +349,51 @@ def main():
 
     # set up cache for tensors to be cached from teacher feature extraction
     cache = FeatureCache(data["feature_cache"]) if data["feature_cache"] else None
+    if args.cache_only and cache is None:
+        parser.error("--cache-only needs data.feature_cache")
     cache_points = sorted(points) if (cache is not None and args.cache_only) else []
 
     # read train + validation images from manifests
     train_rows = read_manifest(data["train_manifests"], limit=data["train_limit"])
     val_rows = read_manifest(data["val_manifests"], limit=data["val_limit"]) if data["val_manifests"] else []
+    val_fast_rows = read_manifest(data["val_fast_manifests"]) if data["val_fast_manifests"] else []
+    if not {r["id"] for r in val_fast_rows} <= {r["id"] for r in val_rows}:
+        parser.error("data.val_fast_manifests must be a subset of the validation rows")
     if cache is not None and not args.cache_only:
         # Use cached activations where present (teacher is still available for the rest).
         cache_points = sorted(p for p in points if all(cache.has(r["id"]) for r in train_rows + val_rows))
 
+    def patch_count(row):
+        """Patches of one example: the cached grid in cache-only mode, else an estimate from the image size."""
+        return cache.patch_count(row["id"]) if args.cache_only else estimate_patch_count(row, processor)
+
+    def make_dataset(rows):
+        # cache-only: features + grid_thw only (no pixel tensors are read or needed)
+        return ImageManifestDataset(rows, processor, cache, cache_points, load_pixels=not args.cache_only)
+
     def make_loader(rows, shuffle):
-        """helper function to """
-        dataset = ImageManifestDataset(rows, processor, cache, cache_points) # defines how to extract image data
-        counts = [estimate_patch_count(r, processor) for r in rows] # defines the patches needed per image
+        """Patch-budget batches. An image above the whole budget is a batch of its own, never dropped."""
+        counts = [patch_count(r) for r in rows] # defines the patches needed per image
 
         # determines which indices belong in each batch
-        sampler = PatchBudgetBatchSampler(counts, training_config["max_patches_per_batch"], shuffle=shuffle, seed=training_config["seed"])
-        if sampler.dropped:
-            print(f"{sampler.dropped} examples exceed max_patches_per_batch and are skipped")
+        sampler = PatchBudgetBatchSampler(counts, training_config["max_patches_per_batch"], shuffle=shuffle,
+                                          seed=training_config["seed"], drop_oversize=False)
+        if sampler.oversize:
+            print(f"{sampler.oversize} examples exceed max_patches_per_batch; each is a single-example batch")
 
-        # use pytorch module for DataLoader
-        return DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_packed,
-                          num_workers=training_config["num_workers"]), sampler
+        # use pytorch module for DataLoader. Its own generator keeps loader bookkeeping from
+        # drawing on the global RNG, so evaluations and resumes do not shift the training noise.
+        return DataLoader(make_dataset(rows), batch_sampler=sampler, collate_fn=collate_packed,
+                          num_workers=training_config["num_workers"], generator=torch.Generator()), sampler
 
     # create the loader
     train_loader, train_sampler = make_loader(train_rows, shuffle=True)
-    val_loader = make_loader(val_rows, shuffle=False)[0] if val_rows else None
+    val_loader = make_loader(val_rows, shuffle=False)[0] if (val_rows and not step_mode) else None
 
     def make_eval_loader(rows):
         # step mode: one image per batch, fixed order, so dataset-level metrics need no batch weighting
-        dataset = ImageManifestDataset(rows, processor, cache, cache_points)
-        return DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_packed)
+        return DataLoader(make_dataset(rows), batch_size=1, shuffle=False, collate_fn=collate_packed,
+                          generator=torch.Generator())
 
     channel_stats, channel_mean = None, None
     if data["channel_stats"]:
@@ -396,6 +422,7 @@ def main():
 
     run = RunDir(args.runs_dir, config.name, resume=args.resume)
     start_epoch, step, best, skip_batches = 0, 0, math.inf, 0
+    seen = {"images": 0, "tokens": 0, "seconds": 0.0}  # cumulative over the whole run, across resumes
     resuming = args.resume and run.checkpoint_path("latest").exists()
     source = run.checkpoint_path("latest") if resuming else args.init_checkpoint
     restored = None
@@ -410,6 +437,7 @@ def main():
         scheduler.load_state_dict(ckpt["optimizers"]["scheduler"])
         extra = ckpt.get("extra", {})
         step, best = ckpt["step"], extra.get("best", math.inf)
+        seen.update(extra.get("seen", {}))
         if "batches_done_in_epoch" in extra:
             # saved inside epoch ckpt["epoch"]: redo that epoch's (deterministic) order, skipping what ran
             start_epoch, skip_batches = ckpt["epoch"], extra["batches_done_in_epoch"]
@@ -439,40 +467,61 @@ def main():
             "cache_points": cache_points, "split": config.split.as_dict(), "option": config.split.option,
             "parameters": student.parameter_counts(), "train_examples": len(train_rows),
             "val_examples": len(val_rows), "software": software_info(), "hardware": hardware_info(device),
+            "val_fast_examples": len(val_fast_rows), "train_eval_ids": [r["id"] for r in
+                                                                         train_rows[: data["train_eval_limit"]]],
+            "val_fast_ids": [r["id"] for r in val_fast_rows],
+            "manifests": {str(p): sha256_file(p) for p in
+                          data["train_manifests"] + data["val_manifests"] + data["val_fast_manifests"]},
+            "channel_stats_sha256": sha256_file(data["channel_stats"]) if data["channel_stats"] else None,
+            "batching": {"train_batches_per_epoch": len(train_sampler), "oversize_single_example_batches":
+                         train_sampler.oversize, "dropped": train_sampler.dropped,
+                         "train_patches": sum(train_sampler.patch_counts),
+                         "max_patches_one_image": max(train_sampler.patch_counts)},
         })
 
     train_eval_loader = make_eval_loader(train_rows[: data["train_eval_limit"]]) if step_mode else None
     val_eval_loader = make_eval_loader(val_rows) if (step_mode and val_rows) else None
+    val_fast_loader = make_eval_loader(val_fast_rows) if (step_mode and val_fast_rows) else None
 
     def save_latest(epoch, batches_done=None):
-        extra = {"best": best, "rng": rng_state(device)}
+        extra = {"best": best, "rng": rng_state(device), "seen": dict(seen)}
         if batches_done is not None:
             extra["batches_done_in_epoch"] = batches_done
         optimizers = {"main": main_opt, "aux": aux_opt, "scheduler": scheduler}
         save_checkpoint(run.checkpoint_path("latest"), student, epoch, step, optimizers, extra=extra)
 
-    def step_evaluation(epoch, batches_done, save=True):
-        """Rounded evaluation of the fixed training subset and validation set, then checkpoints."""
+    def step_evaluation(epoch, batches_done, save=True, full=True):
+        """Rounded evaluation, then checkpoints.
+
+        Always: the fixed training subset and the fixed validation subset ("val_fast").
+        ``full``: the whole validation set ("val") too. Only a full evaluation can replace best.pt,
+        so the criterion is always the same images; latest.pt is written either way.
+        """
         nonlocal best
-        record = {"phase": "eval", "epoch": epoch, "step": step, "quantization": config["quantization"]["eval"]}
-        for name, loader in (("train", train_eval_loader), ("val", val_eval_loader)):
+        record = {"phase": "eval", "epoch": epoch, "step": step, "quantization": config["quantization"]["eval"],
+                  "full_validation": full, "images_seen": seen["images"], "tokens_seen": seen["tokens"]}
+        loaders = [("train", train_eval_loader), ("val_fast", val_fast_loader)]
+        if full:
+            loaders.append(("val", val_eval_loader))
+        for name, loader in loaders:
             if loader is not None:
                 record[name] = evaluate_dataset(student, split, loader, config, points, channel_stats, target_mean,
                                                 device, args.coded_examples, args.diagnostic_channel)
         run.log(record)
-        coded = [record[k]["coded"] for k in ("train", "val") if "coded" in record.get(k, {})]
-        if any(not c["roundtrip_exact"] for c in coded):
+        names = [name for name, _ in loaders if name in record]
+        if any(not record[k]["coded"]["roundtrip_exact"] for k in names if "coded" in record[k]):
             run.log({"phase": "abort", "step": step, "reason": "entropy round trip failed"})
             raise SystemExit("entropy round trip failed; run stopped (latest.pt is the last good state)")
         print(f"eval step {step}: " + " | ".join(
             f"{k} loss {record[k]['loss']:.0f} std-mse {record[k]['standardized_mse']:.4f} "
-            f"relL2 {record[k]['relative_l2']:.4f}" for k in ("train", "val") if k in record))
+            f"relL2 {record[k]['relative_l2']:.4f}" for k in names), flush=True)
         if not save:
             return
-        score = record.get("val", record["train"])["loss"]
-        if score < best:
-            best = score
-            save_checkpoint(run.checkpoint_path("best"), student, epoch, step, extra={"best": best})
+        if full:
+            score = record.get("val", record["train"])["loss"]
+            if score < best:
+                best = score
+                save_checkpoint(run.checkpoint_path("best"), student, epoch, step, extra={"best": best})
         save_latest(epoch, batches_done)
         milestone = training_config["milestone_every_steps"]
         if milestone and step % milestone == 0:
@@ -482,15 +531,19 @@ def main():
     if step_mode and not resuming:
         step_evaluation(start_epoch, skip_batches, save=False)  # starting point (initialisation or source run)
     epoch = start_epoch
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    window = {"data": 0.0, "compute": 0.0, "steps": 0}  # seconds since the last logged step
     while (step < max_steps) if step_mode else (epoch < training_config["epochs"]):
         train_sampler.set_epoch(epoch)
+        train_sampler.start_batch = skip_batches  # resume inside an epoch without loading what already ran
         epoch_start = time.time() #record start time
         stop = False
-        for batch_index, batch in enumerate(train_loader):
-            if batch_index < skip_batches:
-                continue  # already trained on before the checkpoint we restored
+        tick = time.time()
+        for batch_index, batch in enumerate(train_loader, start=skip_batches):
+            loaded = time.time()
             # run student and compute main objective
-            loss, log, _, _, _ = run_batch(student, split, batch, config, points, channel_stats, device, True)
+            loss, log, _, _, grid = run_batch(student, split, batch, config, points, channel_stats, device, True)
             aux = student.entropy.aux_loss()
             main_opt.zero_grad(set_to_none=True) #clear previous gradients
             loss.backward() # compute gradients of loss with respect tio the main parameters
@@ -511,24 +564,49 @@ def main():
             # auxiliary parameters update
             aux_opt.zero_grad(set_to_none=True)
             aux.backward()
+            if log_now:
+                grads["grad_norm/aux_quantiles"] = grad_norm(student.aux_parameters()).item()
             aux_opt.step()
 
             step += 1
+            seen["images"] += len(batch["ids"])
+            seen["tokens"] += sum(token_counts(grid))
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)  # so the timings below include the GPU work
+            now = time.time()
+            window["data"] += loaded - tick
+            window["compute"] += now - loaded
+            window["steps"] += 1
+            seen["seconds"] += now - tick
             if log_now:
                 run.log({"phase": "train", "epoch": epoch, "step": step, "lr": scheduler.get_last_lr()[0],
                          "aux_loss": aux.item(), "grad_norm": total_grad.item(), **grads,
-                         **{k: float(v) for k, v in log.items()}})
+                         **{k: float(v) for k, v in log.items()},
+                         "batch_images": len(batch["ids"]), "batch_tokens": sum(token_counts(grid)),
+                         "images_seen": seen["images"], "tokens_seen": seen["tokens"],
+                         "train_seconds": seen["seconds"],
+                         "data_seconds_per_step": window["data"] / window["steps"],
+                         "compute_seconds_per_step": window["compute"] / window["steps"],
+                         "gpu_peak_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None})
                 print(f"epoch {epoch} step {step} loss {log['loss']:.4f} mse {log['mse']:.5f} "
-                      f"bits/tok {log['bits_per_visual_token']:.1f}")
+                      f"bits/tok {log['bits_per_visual_token']:.1f}", flush=True)
+                window = {"data": 0.0, "compute": 0.0, "steps": 0}
             if step_mode:
                 if step % eval_every == 0 or step >= max_steps:
-                    step_evaluation(epoch, batch_index + 1)
+                    step_evaluation(epoch, batch_index + 1,
+                                    full=not full_eval_every or step % full_eval_every == 0 or step >= max_steps)
                 if step >= max_steps:
                     stop = True
                     break
+            tick = time.time()  # evaluation and checkpoint time is not training time
         skip_batches = 0
         if stop:
-            break  # scheduler.step() for this epoch happens on resume, after the skipped batches
+            # scheduler.step() for this epoch happens on resume, after the skipped batches
+            run.log({"phase": "done", "step": step, "epoch": epoch, "images_seen": seen["images"],
+                     "tokens_seen": seen["tokens"], "train_seconds": seen["seconds"],
+                     "train_examples": len(train_rows), "image_passes": seen["images"] / len(train_rows),
+                     "best_full_validation_loss": best})
+            break
         scheduler.step()
         if step_mode:
             epoch += 1

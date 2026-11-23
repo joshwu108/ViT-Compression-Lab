@@ -157,11 +157,16 @@ DEFAULTS = {
         # and save latest/best every eval_every_steps, keep a step-XXXXXX.pt every
         # milestone_every_steps. Epoch-end evaluation and epoch-XXX.pt files are skipped.
         "max_steps": None, "eval_every_steps": None, "milestone_every_steps": None,
+        # With full_eval_every_steps set, the checks every eval_every_steps use only the fixed
+        # training subset and data.val_fast_manifests; the full validation set is evaluated every
+        # full_eval_every_steps (and at max_steps), and only those evaluations select best.pt.
+        "full_eval_every_steps": None,
     },
     "data": {
         "train_manifests": [], "val_manifests": [], "train_limit": None, "val_limit": 64,
         "train_eval_limit": 64,  # step mode: first N training images, evaluated like validation
         "feature_cache": None, "channel_stats": None,
+        "val_fast_manifests": [],  # fixed subset of the validation images for frequent checks
     },
     "teacher": {
         "checkpoint": "Qwen/Qwen3.8-27B",
