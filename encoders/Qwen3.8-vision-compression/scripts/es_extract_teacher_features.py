@@ -4,6 +4,7 @@ Loads just the Qwen3.5 vision tower from the local checkpoint cache,
 runs each manifest image once, and stores pixel values, grid and
 the requested activations as one safetensors file per example. Also
 accumulates per-channel mean/std per point for the standardised distortion.
+Use --stats-only to compute these statistics without storing activation files.
 
     python encoders/Qwen3.8-vision-compression/scripts/es_extract_teacher_features.py \
         data/train/manifest.jsonl --points block_16 merger \
@@ -28,7 +29,10 @@ from vit_compression_lab.entropic.qwen.data import (  # noqa: E402
     preprocess_image,
     read_manifest,
 )
-from vit_compression_lab.entropic.qwen.vision_tower import TeacherSplit, load_vision_tower  # noqa: E402
+from vit_compression_lab.entropic.qwen.vision_tower import (  # noqa: E402
+    TeacherSplit,
+    load_vision_tower,
+)
 from vit_compression_lab.run_checkpoint import write_json  # noqa: E402
 
 
@@ -75,6 +79,8 @@ def main():
     parser.add_argument("--limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-pixels", action="store_true", help="Do not store pixel_values (saves ~7 MB/image)")
+    parser.add_argument("--stats-only", action="store_true",
+                        help="Compute channel statistics over all manifest rows without storing features")
     parser.add_argument("--verify-depths", nargs="*", type=int, default=[],
                         help="Check suffix(prefix(d)) against the full forward on the first image")
     args = parser.parse_args()
@@ -93,10 +99,11 @@ def main():
         "manifests": [str(p) for p in args.manifests], "examples": len(rows),
         "teacher_dtype": str(split.dtype), "software": software_info(),
         "hardware": hardware_info(args.device), "started_at": time.time(), "verification": [],
+        "stats_only": args.stats_only,
     }
     done = 0
     for index, row in enumerate(rows, 1):
-        if cache.has(row["id"]) and not args.overwrite:
+        if not args.stats_only and cache.has(row["id"]) and not args.overwrite:
             continue
         pixel_values, grid_thw = preprocess_image(processor, row["image_path"])
         pixels = pixel_values.to(args.device, split.dtype)
@@ -107,16 +114,18 @@ def main():
             print("verification:", info["verification"])
         with torch.inference_mode():
             acts = split.collect(pixels, grid, args.points)
-        tensors = {"grid_thw": grid_thw}
-        if not args.no_pixels:
-            tensors["pixel_values"] = pixels.cpu()
         for point, tensor in acts.items():
-            tensors[point] = tensor.cpu()
             stats.add(point, tensor)
-        cache.save(row["id"], tensors, {"id": row["id"], "image_path": row["image_path"]})
+        if not args.stats_only:
+            tensors = {"grid_thw": grid_thw}
+            if not args.no_pixels:
+                tensors["pixel_values"] = pixels.cpu()
+            tensors.update({point: tensor.cpu() for point, tensor in acts.items()})
+            cache.save(row["id"], tensors, {"id": row["id"], "image_path": row["image_path"]})
         done += 1
         if done % 50 == 0 or index == len(rows):
-            print(f"{index}/{len(rows)} cached ({done} new)")
+            action = "measured" if args.stats_only else "cached"
+            print(f"{index}/{len(rows)} {action} ({done} processed)")
 
     if done:
         result = stats.result()

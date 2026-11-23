@@ -62,6 +62,7 @@ def main():
     if args.output.exists():
         parser.error(f"{args.output} exists; choose a new name")
 
+    # load config, training statistics, manifests, and cached merger features
     device = torch.device(args.device)
     config = StudentConfig.load(args.config)
     data = config["data"]
@@ -78,6 +79,7 @@ def main():
     # PCA of standardized training features (rows of vt are the principal directions).
     _, _, vt = torch.linalg.svd((train - mean) / std, full_matrices=False)
 
+    # reference methods
     methods = {"zero": lambda h, grid: (torch.zeros_like(h), 0.0),
                "train_mean": lambda h, grid: (mean.expand_as(h), 0.0)}
     for k in args.pca_ranks:

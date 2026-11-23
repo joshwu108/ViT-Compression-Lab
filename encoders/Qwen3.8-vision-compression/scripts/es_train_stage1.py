@@ -131,7 +131,7 @@ def run_batch(student, split, batch, config, points, channel_stats, device, trai
     counts_by_level = {lvl: counts_for_level(grid, lvl) for lvl in ("patch", "token")}
     targets = {p: acts[p].float() for p in points}
 
-    # clalculate the training objective
+    # calculate the training objective
     loss, log = stage1_loss(out, targets, counts_by_level, n_visual_tokens, config, channel_stats)
     return loss, log, out, acts, grid
 
