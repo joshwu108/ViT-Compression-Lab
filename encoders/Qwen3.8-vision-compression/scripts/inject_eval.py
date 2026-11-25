@@ -202,6 +202,16 @@ def prefill_logits(model, kwargs):
     return model(**kwargs, use_cache=False).logits.float()
 
 
+def max_abs_logit_diff(a, b, positions=256):
+    """max |a - b| over [1, T, vocab] logits, a few positions at a time.
+
+    Same value as (a - b).abs().max(), without two more full-size temporaries: for a
+    large image each float32 logits tensor is several GB.
+    """
+    return max((a[:, i:i + positions] - b[:, i:i + positions]).abs().max().item()
+               for i in range(0, a.shape[1], positions))
+
+
 def generate(model, kwargs, generation_config):
     model.model.rope_deltas = None  # fresh cache is created inside each generate()
     output = model.generate(**kwargs, generation_config=generation_config)
@@ -233,10 +243,10 @@ def check_identity(model, inputs, generation_config):
     identity_ids = generate(model, injected_inputs(inputs, features), generation_config)
     reference_logits = prefill_logits(model, dict(inputs))
     rerun_logits = prefill_logits(model, dict(inputs))
+    rerun_diff = max_abs_logit_diff(rerun_logits, reference_logits)
+    del rerun_logits  # only its difference is needed; frees GPU memory before the next forward
     identity_logits = injected_prefill(model, inputs, features)
-
-    rerun_diff = (rerun_logits - reference_logits).abs().max().item()
-    identity_diff = (identity_logits - reference_logits).abs().max().item()
+    identity_diff = max_abs_logit_diff(identity_logits, reference_logits)
     report = {
         "reference_rerun_max_abs_logit_diff": rerun_diff,
         "identity_max_abs_logit_diff": identity_diff,

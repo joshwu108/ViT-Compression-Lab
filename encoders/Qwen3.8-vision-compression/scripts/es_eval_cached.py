@@ -1,8 +1,12 @@
-"""Dataset-level evaluation of a merger->merger student from the feature cache.
+"""Dataset-level evaluation of a student from the feature cache.
 
-No Qwen model and no images are loaded: cached merger features go through the
-student with rounded latents, one image at a time, and every image is actually
-entropy coded (unless --coded-examples limits it).
+No images are loaded: cached features go through the student with rounded
+latents, one image at a time, and every image is actually entropy coded
+(unless --coded-examples limits it). A merger->merger student (Option C) needs
+no Qwen model. For a student that reconstructs a ViT block (Option B) the
+frozen vision tower is loaded to carry the reconstruction on to the merger;
+"pooled" then describes the decoder target and "merger_pooled" the LLM-facing
+merger features, the location a merger->merger student is measured at.
 
     python encoders/Qwen3.8-vision-compression/scripts/es_eval_cached.py \
         data/es-abc-pilot5k/val_manifest.jsonl \
@@ -35,6 +39,7 @@ from vit_compression_lab.entropic.diagnostics import FeatureErrorStats  # noqa: 
 from vit_compression_lab.entropic.grid import counts_for_level, token_counts  # noqa: E402
 from vit_compression_lab.entropic.losses import stage1_loss  # noqa: E402
 from vit_compression_lab.entropic.qwen.data import FeatureCache, read_manifest  # noqa: E402
+from vit_compression_lab.entropic.qwen.vision_tower import TeacherSplit, load_vision_tower  # noqa: E402
 from vit_compression_lab.run_checkpoint import sha256_file, write_json  # noqa: E402
 
 
@@ -58,12 +63,24 @@ def main():
     student = student.to(device).eval()
     student.entropy.update(force=True)
     sp = config.split
-    if (sp.encoder_input, sp.decoder_target) != ("merger", "merger"):
-        raise SystemExit("es_eval_cached.py supports merger -> merger students only")
+    through_teacher = sp.decoder_target != "merger"
+    if sp.encoder_input == "pixels":
+        raise SystemExit("es_eval_cached.py needs a cached encoder input (the cache stores no pixels)")
     cache = FeatureCache(args.feature_cache or config["data"]["feature_cache"])
     stats_path = args.channel_stats or config["data"]["channel_stats"]
-    stats = torch.load(stats_path, weights_only=False)["merger"]
+    all_stats = torch.load(stats_path, weights_only=False)
+    stds = {p: v["std"].to(device) for p, v in all_stats.items()}
+    stats = all_stats[sp.decoder_target]
     mean, std = stats["mean"].to(device), stats["std"].to(device)
+    split = merger_err = None
+    if through_teacher:
+        teacher = config["teacher"]
+        split = TeacherSplit(load_vision_tower(teacher["checkpoint"], teacher["revision"], device=device,
+                                               dtype=getattr(torch, teacher["dtype"]),
+                                               attn_implementation=teacher["attn_implementation"]))
+        merger_err = FeatureErrorStats(all_stats["merger"]["mean"].to(device), stds["merger"])
+    points = sorted({sp.encoder_input, sp.decoder_target, "merger"})
+    channel = args.diagnostic_channel if args.diagnostic_channel < mean.numel() else None
     rows = read_manifest(args.manifests, limit=args.limit)
     n_coded = len(rows) if args.coded_examples is None else args.coded_examples
 
@@ -72,13 +89,23 @@ def main():
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     for index, row in enumerate(rows):
-        tensors = cache.load(row["id"], ["grid_thw", "merger"])
-        grid, target = tensors["grid_thw"].to(device), tensors["merger"].to(device).float()
+        tensors = cache.load(row["id"], ["grid_thw", *points])
+        grid = tensors["grid_thw"].to(device)
+        acts = {p: tensors[p].to(device).float() for p in points}
+        source, target = acts[sp.encoder_input], acts[sp.decoder_target]
         n = sum(token_counts(grid))
-        out = student(target, grid, quant_mode="round")
+        out = student(source, grid, quant_mode="round")
         out["deep"] = {}
+        if through_teacher:
+            # frozen blocks and merger on the reconstruction: what the LLM would receive
+            merger_hat = split.suffix(out["recon"].to(split.dtype), grid, sp.target_depth(split.dims)).float()
+            merger_err.add(acts["merger"], merger_hat)
+            out["deep"] = {term["point"]: merger_hat for term in config["deep_supervision"]
+                           if term["point"] == "merger"}
+            if len(out["deep"]) != len(config["deep_supervision"]):
+                raise SystemExit("only merger deep-supervision terms are supported here")
         counts = {level: counts_for_level(grid, level) for level in ("patch", "token")}
-        _, log = stage1_loss(out, {"merger": target}, counts, n, config, {"merger": std})
+        _, log = stage1_loss(out, acts, counts, n, config, stds)
         student_err.add(target, out["recon"])
         mean_err.add(target, mean.expand_as(target))
         image = FeatureErrorStats(mean, std)
@@ -89,9 +116,13 @@ def main():
                   "estimated_bits": float(log["bits"]),
                   **{k: per_image[k] for k in ("standardized_mse", "fvu_standardized", "raw_mse", "relative_l2",
                                                "cosine", "cosine_centered", "cosine_standardized")}}
+        if through_teacher:
+            image = FeatureErrorStats(merger_err.mean, merger_err.std)
+            image.add(acts["merger"], merger_hat)
+            record["merger"] = {k: v for k, v in image.result().items() if k != "tokens"}
         if index < n_coded:
             tick = time.time()
-            strings, latent_counts, _ = student.compress(target, grid)
+            strings, latent_counts, _ = student.compress(source, grid)
             blob = payload_lib.pack(payload_lib.make_header(sp, grid.cpu(), latent_counts, student.latent_channels),
                                     strings)
             header, strings_back = payload_lib.unpack(blob)
@@ -122,14 +153,22 @@ def main():
         "images": len(records), "tokens": tokens, "quantization": "round",
         "objective_mean_over_images": {k: sum(r[k] for r in records) / len(records)
                                        for k in ("loss", "distortion", "rate_nats")},
-        "pooled": student_err.result(args.diagnostic_channel),
-        "pooled_training_mean_predictor": mean_err.result(args.diagnostic_channel),
+        "split": sp.as_dict(), "pooled_point": sp.decoder_target,
+        "pooled": student_err.result(channel),
+        "pooled_training_mean_predictor": mean_err.result(channel),
         "estimated_bits_per_visual_token_pooled": sum(r["estimated_bits"] for r in records) / tokens,
         "per_image_median": {k: median(k) for k in ("standardized_mse", "fvu_standardized", "raw_mse", "relative_l2",
                                                     "cosine", "cosine_standardized", "tokens")},
         "seconds": time.time() - started, "coding_seconds": coding_seconds,
         "gpu_peak_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
     }
+    if through_teacher:
+        summary["merger_pooled"] = merger_err.result(
+            args.diagnostic_channel if args.diagnostic_channel < merger_err.mean.numel() else None)
+        summary["merger_per_image_median"] = {
+            k: statistics.median(r["merger"][k] for r in records)
+            for k in ("standardized_mse", "fvu_standardized", "raw_mse", "relative_l2", "cosine",
+                      "cosine_standardized")}
     summary["per_image_median"]["estimated_bits_per_visual_token"] = statistics.median(
         r["estimated_bits"] / r["tokens"] for r in records)
     if coded:

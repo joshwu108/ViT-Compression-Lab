@@ -2,7 +2,11 @@
 
 Only the vision tower is loaded (never the LLM). With a feature cache that
 holds the encoder input and the decoder target, and no deep-supervision terms,
-no teacher model is loaded at all (``--cache-only``).
+no teacher model is loaded at all (``--cache-only``). ``--cached-features``
+also reads every teacher activation from the cache (no pixels, no image
+preprocessing) but keeps the frozen vision tower loaded: Option B's
+deep-supervision terms run the reconstruction through the frozen suffix, with
+gradient, on every update.
 
     python encoders/Qwen3.8-vision-compression/scripts/es_train_stage1.py \
         --config configs/qwen3_8/entropic_student/c_merger_tokenmlp_beta0.08.json \
@@ -182,7 +186,7 @@ def evaluate(student, split, loader, config, points, channel_stats, device, code
 
 @torch.no_grad()
 def evaluate_dataset(student, split, loader, config, points, channel_stats, mean, device, coded_examples,
-                     channel=None, started=None):
+                     channel=None, started=None, channel_means=None):
     """Step-mode evaluation. ``loader`` yields ONE image per batch.
     Measures how good the student performs on a whole set of images in setp mode
 
@@ -195,7 +199,8 @@ def evaluate_dataset(student, split, loader, config, points, channel_stats, mean
         mean - per-channel training mean at decoder target
         device - GPU or CPU
         coded_examples - how many images to entropy code
-        channel - channel index whose error is reported separately
+        channel - channel index whose error is reported separately (skipped if the target has fewer channels)
+        channel_means - dictionary from point to per-channel training mean, for the deep-supervision points
     """
     started = started or time.time()
     student.eval() # eval quantization rounding
@@ -204,6 +209,7 @@ def evaluate_dataset(student, split, loader, config, points, channel_stats, mean
     sp = config.split
     codable = config["quantization"]["eval"] != "none"
     stats = None # error accumulator
+    deep_stats = {}  # the same pooled metrics at each deep-supervision point (e.g. the merger for Option B)
     logs, coded, bits, tokens = [], [], 0.0, 0
 
     # iterate over images
@@ -217,9 +223,18 @@ def evaluate_dataset(student, split, loader, config, points, channel_stats, mean
             c = target.shape[1]
             std = channel_stats[sp.decoder_target] if channel_stats else torch.ones(c, device=device)
             stats = FeatureErrorStats(mean if mean is not None else torch.zeros(c, device=device), std)
+            if channel is not None and channel >= c:
+                channel = None  # e.g. merger channel 3994 does not exist in a 1,152-channel block target
 
         # add errors to running sums
         stats.add(target, out["recon"])
+        for point, propagated in out["deep"].items():
+            if point not in deep_stats:
+                width = propagated.shape[1]
+                deep_stats[point] = FeatureErrorStats(
+                    (channel_means or {}).get(point, torch.zeros(width, device=device)),
+                    (channel_stats or {}).get(point, torch.ones(width, device=device)))
+            deep_stats[point].add(acts[point].float(), propagated.float())
         logs.append({k: float(v) for k, v in log.items()})
         n = sum(token_counts(grid))
         bits += float(log["bits"])
@@ -243,6 +258,8 @@ def evaluate_dataset(student, split, loader, config, points, channel_stats, mean
         "estimated_bits_per_visual_token": bits / tokens if codable else None,
         **stats.result(channel),
     }
+    if deep_stats:
+        summary["deep"] = {point: value.result() for point, value in deep_stats.items()}
     if coded:
         summary["coded"] = {
             "images": len(coded),
@@ -273,6 +290,13 @@ def grad_norm(parameters):
     return torch.sqrt(sum(g.pow(2).sum() for g in grads)) if grads else torch.tensor(0.0)
 
 
+def teacher_fingerprint(split):
+    """Sum of every teacher weight (float64): identical before and after training iff nothing moved it."""
+    if split is None:
+        return None
+    return float(sum(p.detach().double().sum() for p in split.visual.parameters()))
+
+
 def rng_state(device):
     state = {"torch": torch.get_rng_state()}
     if device.type == "cuda":
@@ -293,6 +317,9 @@ def main():
     parser.add_argument("--epochs", type=int, help="Override training.epochs")
     parser.add_argument("--cache-only", action="store_true",
                         help="Never load the teacher; all needed points must be cached")
+    parser.add_argument("--cached-features", action="store_true",
+                        help="Read all needed points and grids from the cache (no pixels, no preprocessing) "
+                             "but keep the frozen teacher for the deep-supervision suffix (Option B)")
     parser.add_argument("--coded-examples", type=int, default=4,
                         help="Images actually entropy coded at each evaluation")
     parser.add_argument("--run-name", help="Run directory name (default: the config's name)")
@@ -329,8 +356,12 @@ def main():
         parser.error("training.full_eval_every_steps needs step mode and a multiple of eval_every_steps")
 
     teacher = config["teacher"] # extract the teacher mdoel
-    # --cache-only reads features and grids from the cache: no image preprocessing, no processor
-    processor = None if args.cache_only else load_processor(teacher["checkpoint"], teacher["revision"])
+    # --cache-only and --cached-features read features and grids from the cache: no image preprocessing,
+    # no processor. Only --cache-only also drops the teacher.
+    if args.cache_only and args.cached_features:
+        parser.error("--cache-only already reads everything from the cache; pass only one of the two")
+    from_cache = args.cache_only or args.cached_features
+    processor = None if from_cache else load_processor(teacher["checkpoint"], teacher["revision"])
     points = needed_points(config) # teacher feature locations needed
     split = None
     dims = VisionDims()
@@ -349,9 +380,9 @@ def main():
 
     # set up cache for tensors to be cached from teacher feature extraction
     cache = FeatureCache(data["feature_cache"]) if data["feature_cache"] else None
-    if args.cache_only and cache is None:
-        parser.error("--cache-only needs data.feature_cache")
-    cache_points = sorted(points) if (cache is not None and args.cache_only) else []
+    if from_cache and cache is None:
+        parser.error("--cache-only / --cached-features need data.feature_cache")
+    cache_points = sorted(points) if (cache is not None and from_cache) else []
 
     # read train + validation images from manifests
     train_rows = read_manifest(data["train_manifests"], limit=data["train_limit"])
@@ -359,17 +390,17 @@ def main():
     val_fast_rows = read_manifest(data["val_fast_manifests"]) if data["val_fast_manifests"] else []
     if not {r["id"] for r in val_fast_rows} <= {r["id"] for r in val_rows}:
         parser.error("data.val_fast_manifests must be a subset of the validation rows")
-    if cache is not None and not args.cache_only:
+    if cache is not None and not from_cache:
         # Use cached activations where present (teacher is still available for the rest).
         cache_points = sorted(p for p in points if all(cache.has(r["id"]) for r in train_rows + val_rows))
 
     def patch_count(row):
         """Patches of one example: the cached grid in cache-only mode, else an estimate from the image size."""
-        return cache.patch_count(row["id"]) if args.cache_only else estimate_patch_count(row, processor)
+        return cache.patch_count(row["id"]) if from_cache else estimate_patch_count(row, processor)
 
     def make_dataset(rows):
         # cache-only: features + grid_thw only (no pixel tensors are read or needed)
-        return ImageManifestDataset(rows, processor, cache, cache_points, load_pixels=not args.cache_only)
+        return ImageManifestDataset(rows, processor, cache, cache_points, load_pixels=not from_cache)
 
     def make_loader(rows, shuffle):
         """Patch-budget batches. An image above the whole budget is a batch of its own, never dropped."""
@@ -420,6 +451,7 @@ def main():
     # schedules certain milestones where learning rate is reduced
     scheduler = torch.optim.lr_scheduler.MultiStepLR(main_opt, milestones=training_config["milestones"], gamma=training_config["gamma"])
 
+    teacher_weights_before = teacher_fingerprint(split)
     run = RunDir(args.runs_dir, config.name, resume=args.resume)
     start_epoch, step, best, skip_batches = 0, 0, math.inf, 0
     seen = {"images": 0, "tokens": 0, "seconds": 0.0}  # cumulative over the whole run, across resumes
@@ -464,6 +496,9 @@ def main():
             "init_checkpoint": restored,
             "stage": 1, "config_sha256": hashlib.sha256(args.config.read_bytes()).hexdigest(),
             "teacher": teacher, "teacher_loaded": split is not None, "points": sorted(points),
+            "teacher_fingerprint": teacher_weights_before,
+            "teacher_trainable_parameters": sum(p.requires_grad for p in split.visual.parameters())
+            if split is not None else None,
             "cache_points": cache_points, "split": config.split.as_dict(), "option": config.split.option,
             "parameters": student.parameter_counts(), "train_examples": len(train_rows),
             "val_examples": len(val_rows), "software": software_info(), "hardware": hardware_info(device),
@@ -506,7 +541,8 @@ def main():
         for name, loader in loaders:
             if loader is not None:
                 record[name] = evaluate_dataset(student, split, loader, config, points, channel_stats, target_mean,
-                                                device, args.coded_examples, args.diagnostic_channel)
+                                                device, args.coded_examples, args.diagnostic_channel,
+                                                channel_means=channel_mean)
         run.log(record)
         names = [name for name, _ in loaders if name in record]
         if any(not record[k]["coded"]["roundtrip_exact"] for k in names if "coded" in record[k]):
@@ -605,7 +641,8 @@ def main():
             run.log({"phase": "done", "step": step, "epoch": epoch, "images_seen": seen["images"],
                      "tokens_seen": seen["tokens"], "train_seconds": seen["seconds"],
                      "train_examples": len(train_rows), "image_passes": seen["images"] / len(train_rows),
-                     "best_full_validation_loss": best})
+                     "best_full_validation_loss": best,
+                     "teacher_unchanged": teacher_fingerprint(split) == teacher_weights_before})
             break
         scheduler.step()
         if step_mode:

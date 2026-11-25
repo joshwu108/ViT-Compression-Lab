@@ -164,8 +164,7 @@ def evaluate_example(ie, row, model, processor, student, split, generation_confi
         "feature_dtype": str(features.dtype),
         "compression": f"learned:{student.config.name}",
         "identity_check": identity,
-        "compressed_prefill_max_abs_logit_diff":
-            (compressed_logits - original_logits).abs().max().item(),
+        "compressed_prefill_max_abs_logit_diff": ie.max_abs_logit_diff(compressed_logits, original_logits),
         "compressed_next_token_argmax_changed": not torch.equal(
             compressed_logits[:, last].argmax(-1), original_logits[:, last].argmax(-1)),
         "reconstruction": reconstruction_metrics(features, restored),

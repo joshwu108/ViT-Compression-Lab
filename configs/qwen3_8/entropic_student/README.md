@@ -32,14 +32,14 @@ the training image directory must be supplied and indexed first.
 
 ## Pilot on broader data (`pilot5k/`): Option C is the only active experiment
 
-`pilot5k/` holds three Stage 1 configurations. **Only C is being run.** The A and B
-files are kept unchanged for future work and have not been trained.
+`pilot5k/` holds three Stage 1 configurations. C was run first; B was run on
+2026-11-24 (see "Option B" below). A is kept for future work and has not been trained.
 
 | Config | Split | Student encoder | Status |
 | --- | --- | --- | --- |
 | `c_merger_tokenmlp_beta0.08.json` | merger -> merger | token MLP | **active**: trains from the feature cache alone |
 | `a_pixels_merger_beta0.08.json` | pixels -> merger: full vision replacement | learned patch stem + 2 attention blocks + window MLP | not run |
-| `b_block8_windowmlp_beta0.08.json` | block 8 -> block 8, then frozen Qwen suffix | window MLP | not run |
+| `b_block8_windowmlp_beta0.08.json` | block 8 -> block 8, then frozen Qwen suffix | window MLP | run for 5,000 updates |
 
 On this SSH host, the new pilot's storage lives under
 `/mnt/nfs/joshua/ViT-compression-lab/`. The following local directory links
@@ -148,11 +148,41 @@ Downstream answers on the fixed 70-question pilot use `es_eval.py`, then
 `score_results.py` and `report_retention.py`, exactly as for the INT8 / INT4-g64
 runs. Results are in `outputs/qwen3.8/es-abc-pilot5k/REPORT.md`.
 
-### Notes for A and B (not run)
+### Option B (5,000-update run, 2026-11-24)
 
-A and B have `feature_cache=null` and recompute teacher features during
-training (no `--cache-only`); B reconstructs 1,152-channel block features, so pass
-`--diagnostic-channel 0` (the default channel 3994 is valid only for merger
-targets). Total training losses are not comparable across the setups because B
-has an extra reconstruction term, and equal beta/latent width does not guarantee
-equal bitrate. All A/B timings are unmeasured.
+B has its own cache and statistics, because it needs `block_8` as well as
+`merger` (C's hold `merger` only):
+
+```sh
+.venv/bin/python encoders/Qwen3.8-vision-compression/scripts/es_extract_teacher_features.py \
+  data/es-abc-pilot5k/manifest.jsonl data/es-abc-pilot5k/val_manifest.jsonl \
+  --points block_8 merger --no-pixels --device cuda:0 --verify-depths 8 \
+  --cache-dir outputs/qwen3.8/es-abc-pilot5k-b/cache \
+  --stats-manifests data/es-abc-pilot5k/manifest.jsonl \
+  --stats-output outputs/qwen3.8/es-abc-pilot5k-b/stats/channel_stats.pt
+
+.venv/bin/python encoders/Qwen3.8-vision-compression/scripts/es_train_stage1.py \
+  --config configs/qwen3_8/entropic_student/pilot5k/b_block8_windowmlp_beta0.08.json \
+  --runs-dir runs/qwen3.8/es-abc-pilot5k --device cuda:0 --cached-features --coded-examples 4
+```
+
+`--cached-features` reads the student input and both teacher targets from the
+cache (no pixels, no image processor) but still loads the frozen vision tower:
+on every update the reconstructed block-8 features run through blocks 9-27 and
+the merger with gradient, for the merger deep-supervision term. `--cache-only`
+cannot do this and refuses configs with deep supervision. The two largest
+training images (62,208 and 64,896 patches) are single-image batches and need
+about 38 GB for that update; ordinary 8,192-patch batches need about 6 GB.
+Evaluations also report pooled metrics at the merger under `deep.merger`. The
+default diagnostic channel 3994 is skipped automatically for 1,152-channel
+targets. `es_eval_cached.py` evaluates B on the full validation set, reporting
+block 8 (`pooled`) and merger (`merger_pooled`) separately.
+
+Total training losses are not comparable between B and C because B has an extra
+reconstruction term, and equal beta/latent width does not guarantee equal
+bitrate. Results: `outputs/qwen3.8/es-abc-pilot5k-b/overnight/REPORT.md`.
+
+### Notes for A (not run)
+
+A has `feature_cache=null` and would recompute teacher features during
+training. Its timings are unmeasured.
